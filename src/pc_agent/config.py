@@ -9,16 +9,16 @@ from pathlib import Path
 
 APP_NAME = "PC Agent"
 APP_ID = "pc-agent"
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 # --- Brain ---
-DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_MODEL = "gemini-3.6-flash"
 FALLBACK_MODELS = [
+    "gemini-3.6-flash",
+    "gemini-3.7-flash",
     "gemini-3.8-flash",
-    "gemini-3.8-flash-lite",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-1.5-flash",
 ]
 EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_FALLBACKS = ["gemini-embedding-001", "text-embedding-004"]

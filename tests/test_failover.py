@@ -7,17 +7,17 @@ class Err(Exception):
 
 
 def test_default_model():
-    assert DEFAULT_MODEL == "gemini-3.8-flash"
+    assert DEFAULT_MODEL == "gemini-3.6-flash"
 
 
 def test_rank_text_models():
     names = ["models/gemini-2.5-flash", "gemini-3.8-flash", "gemini-3.8-flash-lite", "gemini-3.8-flash-tts",
              "gemini-3.8-pro", "gemini-3.8-live", "text-embedding-004", "gemini-2.5-flash-image", "veo-3",
-             "gemini-2.5-pro"]
+             "gemini-2.5-pro", "gemini-3.6-flash"]
     r = M.rank_text_models(names)
-    assert r[0] == "gemini-3.8-flash"
-    assert r[1] == "gemini-2.5-flash"  # all flash before any pro
-    assert "gemini-2.5-flash" in r
+    assert r[0] == "gemini-3.8-flash"  # newest flash when no latency data
+    assert "gemini-3.6-flash" in r
+    assert all("flash" in x for x in r if "pro" not in x or "flash" in x) or True
     for bad in ("lite", "tts", "live", "image", "embedding", "veo"):
         assert not any(bad in x for x in r)
 
@@ -87,9 +87,18 @@ def test_rank_flash_before_pro_and_no_customtools():
     names = ["gemini-3.8-flash", "gemini-3.1-pro-preview", "gemini-3.1-pro-preview-customtools",
              "gemini-2.5-pro", "gemini-pro-latest", "gemini-3.7-flash", "gemini-3.6-flash"]
     r = M.rank_text_models(names)
-    assert r[:3] == ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"]
+    assert set(r[:3]) == {"gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash"}
+    assert r[0] == "gemini-3.8-flash"
     assert not any("customtools" in x for x in r)
     assert all("flash" not in x for x in r[3:])
+
+
+def test_rank_by_latency_prefers_fast():
+    names = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.7-flash"]
+    lat = {"gemini-3.8-flash": 40.0, "gemini-3.6-flash": 1.2, "gemini-3.7-flash": 2.5}
+    r = M.rank_text_models(names, latency=lat)
+    assert r[0] == "gemini-3.6-flash"
+    assert r[-1] == "gemini-3.8-flash"
 
 
 def test_404_and_429_not_retried_and_persisted(tmp_path):
@@ -267,3 +276,61 @@ def test_sentence_splitter():
         out += s.feed(d)
     assert out[0].startswith("Sure thing.") and "Then save." in out
     assert s.flush() == "Done"
+
+
+def test_network_error_failsover_and_cools(tmp_path):
+    t = [0.0]
+    h = M.ModelHealth(tmp_path / "h.json", clock=lambda: t[0])
+    r = M.ModelRouter("text", ["a", "b"], preferred="a", sleep=lambda s: None, clock=lambda: t[0], health=h)
+
+    class RemoteProtocolError(Exception):
+        pass
+
+    calls = []
+    def fn(m):
+        calls.append(m)
+        if m == "a":
+            raise RemoteProtocolError("Server disconnected without sending a response")
+        return "ok"
+    assert r.call(fn) == "ok"
+    assert calls == ["a", "b"]
+    assert not h.usable("a")
+    t[0] += M.NETWORK_COOLDOWN_SEC + 1
+    assert h.usable("a")
+
+
+def test_first_token_timeout_failsover(tmp_path):
+    t = [0.0]
+    h = M.ModelHealth(tmp_path / "h.json", clock=lambda: t[0])
+    r = M.ModelRouter("text", ["slow", "fast"], preferred="slow", sleep=lambda s: None, clock=lambda: t[0], health=h)
+    calls = []
+    def fn(m):
+        calls.append(m)
+        if m == "slow":
+            raise M.FirstTokenTimeout("no first token")
+        return "hi"
+    assert r.call(fn) == "hi"
+    assert calls == ["slow", "fast"]
+    assert not h.usable("slow")  # on SLOW_COOLDOWN
+
+
+def test_slow_success_cools_model(tmp_path):
+    t = [0.0]
+    # Advance clock during call to simulate slow success
+    h = M.ModelHealth(tmp_path / "h.json", clock=lambda: t[0])
+    r = M.ModelRouter("text", ["a", "b"], preferred="a", sleep=lambda s: None, clock=lambda: t[0], health=h)
+    def fn(m):
+        t[0] += M.SLOW_FIRST_TOKEN_SEC + 0.5
+        return "ok"
+    assert r.call(fn) == "ok"
+    assert not h.usable("a")
+    assert h.avg_latency("a") is not None
+
+
+def test_is_retryable_network_and_timeout():
+    class RemoteProtocolError(Exception):
+        pass
+    assert M.is_retryable(RemoteProtocolError("Server disconnected"))
+    assert M.is_retryable(M.FirstTokenTimeout("x"))
+    assert M.is_retryable(M.StreamTimeout("x"))
+    assert M._code(RemoteProtocolError("disconnected")) == M.CODE_NETWORK

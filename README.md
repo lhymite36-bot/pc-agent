@@ -33,6 +33,13 @@ Dangerous actions (delete, install, send message/email, payments, registry, shut
 ### Automatic model failover
 A ranked list of good text models is built from `models.list` (cached ~3 h): newest flash first, then pro, then other flash — no lite/TTS/embedding/image/Veo/Live. On 503/429/404/500 it retries once, then silently moves to the next model, sticks with the working one for 15 min, then tries the preferred model again. A 404 on the configured model saves the replacement to config. The UI shows a tiny “Using <model>” note; if everything fails you get a friendly message, never a raw error. Vision, planner, screen awareness, summaries and embeddings share the same failover; TTS and Live voice walk their own expressive model lists, then SAPI.
 
+### Reliability (1.0.5)
+- Hard timeouts: ~10 s to first token, ~60 s total stream — then cancel and fail over.
+- Network errors (`RemoteProtocolError`, timeouts, disconnects) cool the model and fail over.
+- SDK HTTP retries disabled (`HttpRetryOptions(attempts=1)`); we own failover timing.
+- Models ranked by measured first-token latency (fast healthy flash first). Slow models (e.g. a hung 3.8-flash) get a cooldown.
+- Chat shows **thinking…** until the first token; always ends with a reply or a friendly error.
+
 ### Voice UI (1.0.4)
 - Large **Talk** mic button next to the chat input (click-to-talk and hold-to-talk).
 - **Voice mode: On/Off** switch on the Chat page for hands-free Gemini Live (falls back to STT→chat→TTS).

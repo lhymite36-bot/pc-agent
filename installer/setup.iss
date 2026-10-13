@@ -1,6 +1,6 @@
 ; Inno Setup script for PC Agent
 #define MyAppName "PC Agent"
-#define MyAppVersion "1.0.4"
+#define MyAppVersion "1.0.5"
 #define MyAppPublisher "Pedro"
 #define MyAppExeName "PCAgent.exe"
 

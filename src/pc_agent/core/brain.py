@@ -19,11 +19,14 @@ from pc_agent.config import (
 )
 from pc_agent.core.models import (
     ALL_FAILED_MSG,
-    LIST_TTL_SEC,
+    FIRST_TOKEN_TIMEOUT_SEC,
+    STREAM_TOTAL_TIMEOUT_SEC,
     AllModelsFailed,
+    FirstTokenTimeout,
     ModelCatalog,
     ModelHealth,
     ModelRouter,
+    StreamTimeout,
 )
 
 logger = logging.getLogger("pc_agent.brain")
@@ -79,6 +82,20 @@ def _trim_history(history: list[Any], limit: int = MAX_HISTORY_CONTENTS) -> list
     return tail[-1:]
 
 
+
+def _make_client(api_key: str):
+    """Gemini client with SDK retries disabled and bounded HTTP timeouts."""
+    from google import genai
+    from google.genai import types
+
+    # timeout is milliseconds for the google-genai HttpOptions
+    http = types.HttpOptions(
+        timeout=int(STREAM_TOTAL_TIMEOUT_SEC * 1000),
+        retry_options=types.HttpRetryOptions(attempts=1),  # single try; we own failover
+    )
+    return genai.Client(api_key=api_key, http_options=http)
+
+
 class Brain:
     def __init__(
         self,
@@ -93,7 +110,7 @@ class Brain:
         from google.genai import types
 
         self._types = types
-        self.client = genai.Client(api_key=api_key)
+        self.client = _make_client(api_key)
         self.model = model or DEFAULT_MODEL
         self.tool_handlers = tool_handlers or {}
         self.tool_declarations = tool_declarations or []
@@ -114,7 +131,8 @@ class Brain:
     # --- model management (never blocks the request path) ---
 
     def _apply_catalog(self) -> None:
-        self.router.set_candidates(self.catalog.text_models(FALLBACK_MODELS))
+        lat = self.health.latency_map()
+        self.router.set_candidates(self.catalog.text_models(FALLBACK_MODELS, latency=lat))
         self.embed_router.set_candidates(self.catalog.embedding_models(EMBEDDING_FALLBACKS))
 
     def _start_catalog_refresher(self) -> None:
@@ -149,7 +167,7 @@ class Brain:
         return self.catalog.text_models(FALLBACK_MODELS)
 
     def pick_model(self, preferred: str | None = None) -> str:
-        ranked = self.catalog.text_models(FALLBACK_MODELS)
+        ranked = self.catalog.text_models(FALLBACK_MODELS, latency=self.health.latency_map())
         if preferred and (preferred in ranked or not self.catalog.names()):
             self.model = preferred
         elif ranked:
@@ -176,14 +194,29 @@ class Brain:
         t0 = time.time()
 
         def _call(model):
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
             cfg = config or types.GenerateContentConfig()
             cfg = self._with_thinking(cfg, model, thinking)
+
+            def _once(c):
+                return self.client.models.generate_content(model=model, contents=contents, config=c)
+
             try:
-                return self.client.models.generate_content(model=model, contents=contents, config=cfg)
+                with ThreadPoolExecutor(max_workers=1) as pool:
+                    fut = pool.submit(_once, cfg)
+                    try:
+                        return fut.result(timeout=STREAM_TOTAL_TIMEOUT_SEC)
+                    except FuturesTimeout as exc:
+                        raise StreamTimeout(f"{model} exceeded {STREAM_TOTAL_TIMEOUT_SEC}s") from exc
             except Exception as exc:
                 if self._thinking_rejected(exc) and getattr(cfg, "thinking_config", None) is not None:
                     cfg.thinking_config = None
-                    return self.client.models.generate_content(model=model, contents=contents, config=cfg)
+                    with ThreadPoolExecutor(max_workers=1) as pool:
+                        fut = pool.submit(_once, cfg)
+                        try:
+                            return fut.result(timeout=STREAM_TOTAL_TIMEOUT_SEC)
+                        except FuturesTimeout as e2:
+                            raise StreamTimeout(f"{model} exceeded {STREAM_TOTAL_TIMEOUT_SEC}s") from e2
                 self._note_404(model, exc)
                 raise
 
@@ -207,32 +240,81 @@ class Brain:
         return ("400" in s or "invalid" in s) and "think" in s
 
     def generate_stream(self, contents, config, thinking: str = "minimal") -> Iterator[Any]:
-        """Streaming generate with failover. Failover happens before the first chunk is yielded."""
+        """Streaming generate with hard first-token / total timeouts and failover."""
+        from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
         t0 = time.time()
 
         def _open(model):
             cfg = self._with_thinking(config, model, thinking)
-            try:
-                it = iter(self.client.models.generate_content_stream(model=model, contents=contents, config=cfg))
-                first = next(it)  # errors surface here → router can fail over
-            except StopIteration:
-                return model, None, iter(())
-            except Exception as exc:
-                if self._thinking_rejected(exc) and getattr(cfg, "thinking_config", None) is not None:
-                    cfg.thinking_config = None
-                    it = iter(self.client.models.generate_content_stream(model=model, contents=contents, config=cfg))
-                    first = next(it)
-                else:
+            t_open = time.time()
+
+            def _first():
+                try:
+                    it = iter(
+                        self.client.models.generate_content_stream(
+                            model=model, contents=contents, config=cfg
+                        )
+                    )
+                    return next(it), it
+                except StopIteration:
+                    return None, iter(())
+                except Exception as exc:
+                    if self._thinking_rejected(exc) and getattr(cfg, "thinking_config", None) is not None:
+                        cfg.thinking_config = None
+                        it = iter(
+                            self.client.models.generate_content_stream(
+                                model=model, contents=contents, config=cfg
+                            )
+                        )
+                        try:
+                            return next(it), it
+                        except StopIteration:
+                            return None, iter(())
+                    raise
+
+            # Hard cap to first token — cancel wait and fail over
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(_first)
+                try:
+                    first, rest = fut.result(timeout=FIRST_TOKEN_TIMEOUT_SEC)
+                except FuturesTimeout as exc:
+                    timing.info("first_token_timeout %.2fs model=%s", time.time() - t_open, model)
+                    self._note_404(model, FirstTokenTimeout(str(model)))
+                    raise FirstTokenTimeout(
+                        f"no first token from {model} within {FIRST_TOKEN_TIMEOUT_SEC}s"
+                    ) from exc
+                except Exception as exc:
                     self._note_404(model, exc)
                     raise
-            return model, first, it
+            # Record true first-token latency for ranking (router also records wall time of _open)
+            timing.info("first_token %.2fs model=%s", time.time() - t_open, model)
+            return model, first, rest, t_open
 
-        model, first, rest = self.router.call(_open)
+        model, first, rest, t_open = self.router.call(_open)
         self._log_attempts("first_chunk", t0)
         if first is not None:
             yield first
-        for chunk in rest:
-            yield chunk
+        # Total stream budget from when we started the successful model
+        deadline = t_open + STREAM_TOTAL_TIMEOUT_SEC
+        try:
+            for chunk in rest:
+                if time.time() > deadline:
+                    raise StreamTimeout(
+                        f"stream from {model} exceeded {STREAM_TOTAL_TIMEOUT_SEC}s"
+                    )
+                yield chunk
+        except StreamTimeout:
+            # Mid-stream death: don't failover mid-yield (client already has partial text).
+            # Surface as stop; chat_stream will still return what it has.
+            timing.info("stream_timeout %.2fs model=%s", time.time() - t0, model)
+            return
+        except Exception as exc:
+            from pc_agent.core.models import _code
+            if _code(exc) is not None:
+                timing.info("stream_network %.2fs model=%s err=%s", time.time() - t0, model, type(exc).__name__)
+                return
+            raise
         timing.info("stream_done %.2fs model=%s", time.time() - t0, model)
 
     # --- embeddings ---

@@ -47,7 +47,14 @@ class VoiceEngine:
             try:
                 from google import genai
 
-                self._client = genai.Client(api_key=api_key)
+                from google.genai import types as _t
+                self._client = genai.Client(
+                    api_key=api_key,
+                    http_options=_t.HttpOptions(
+                        timeout=60_000,
+                        retry_options=_t.HttpRetryOptions(attempts=1),
+                    ),
+                )
             except Exception as exc:
                 logger.warning("genai client unavailable for voice: %s", exc)
 

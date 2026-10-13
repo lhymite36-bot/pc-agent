@@ -62,6 +62,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     font-size:22px; cursor:pointer; flex-shrink:0; display:flex; align-items:center; justify-content:center; }
   #mic-btn.listening { background:#e74c3c; color:#fff; box-shadow:0 0 0 4px rgba(231,76,60,.35); }
   #mic-btn.busy { opacity:.6; }
+  .msg.thinking { color:var(--muted); font-style:italic; }
   #voice-status { font-size:12px; color:var(--muted); min-height:16px; padding:0 16px 4px; }
   .composer { align-items:center; }
 </style>
@@ -183,10 +184,15 @@ async function sendChat(){
   const text = input.value.trim();
   if (!text) return;
   append('user', text); input.value='';
-  const el = append('assistant', '…');
+  const el = append('assistant', 'thinking…');
+  el.classList.add('thinking');
   let got = '';
+  const watchdog = setTimeout(() => {
+    if (!got && el.classList.contains('thinking')) el.textContent = 'thinking… still working';
+  }, 12000);
   try {
     const r = await fetch('/api/chat/stream', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = '';
     while (true) {
       const {value, done} = await reader.read(); if (done) break;
@@ -195,13 +201,24 @@ async function sendChat(){
       while ((i = buf.indexOf('\n\n')) >= 0) {
         const line = buf.slice(0, i); buf = buf.slice(i + 2);
         if (!line.startsWith('data: ')) continue;
-        const j = JSON.parse(line.slice(6));
-        if (j.delta) { got += j.delta; el.textContent = got; $('#chat-log').scrollTop = 1e9; }
-        if (j.done && j.model_note) $('#model-note').textContent = j.model_note;
+        let j; try { j = JSON.parse(line.slice(6)); } catch(e) { continue; }
+        if (j.delta) {
+          if (el.classList.contains('thinking')) { el.classList.remove('thinking'); got = ''; }
+          got += j.delta; el.textContent = got; $('#chat-log').scrollTop = 1e9;
+        }
+        if (j.done) {
+          if (j.model_note) $('#model-note').textContent = j.model_note;
+          if (!got) { el.classList.remove('thinking'); el.textContent = j.error || 'No reply — try again in a moment.'; }
+        }
       }
     }
-  } catch (e) { if (!got) el.textContent = 'Lost connection to the agent. Try again.'; }
-  if (!got) el.textContent = el.textContent === '…' ? '(no reply)' : el.textContent;
+  } catch (e) {
+    if (!got) { el.classList.remove('thinking'); el.textContent = 'Lost connection to the agent. Try again.'; }
+  } finally { clearTimeout(watchdog); }
+  if (!got && el.classList.contains('thinking')) {
+    el.classList.remove('thinking');
+    el.textContent = 'No reply — try again in a moment.';
+  }
 }
 function append(role, text){
   const d = document.createElement('div');
