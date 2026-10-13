@@ -51,11 +51,7 @@ class Planner:
         try:
             from google.genai import types
 
-            response = self.brain.client.models.generate_content(
-                model=self.brain.model,
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.2),
-            )
+            response = self.brain.generate(prompt, types.GenerateContentConfig(temperature=0.2))
             text = (response.text or "").strip()
             text = _extract_json(text)
             data = json.loads(text)
@@ -129,9 +125,7 @@ class Planner:
                 "Does this screenshot show the expectation was met? "
                 'Answer ONLY JSON: {"met": true/false, "reason": "..."}.'
             )
-            response = self.brain.client.models.generate_content(
-                model=self.brain.model,
-                contents=[
+            response = self.brain.generate([
                     types.Content(
                         role="user",
                         parts=[
@@ -139,9 +133,7 @@ class Planner:
                             types.Part.from_bytes(data=data, mime_type="image/png"),
                         ],
                     )
-                ],
-                config=types.GenerateContentConfig(temperature=0),
-            )
+                ], types.GenerateContentConfig(temperature=0))
             text = _extract_json((response.text or "").strip())
             data_j = json.loads(text)
             return bool(data_j.get("met"))

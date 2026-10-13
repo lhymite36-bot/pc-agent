@@ -16,6 +16,7 @@ import wave
 from pathlib import Path
 from typing import Callable, Iterator
 
+from pc_agent.core.models import is_retryable
 from pc_agent.config import (
     DEFAULT_VOICE,
     LIVE_MODEL,
@@ -150,13 +151,13 @@ class VoiceEngine:
         from google.genai import types
 
         voice = self.voice_id()
-        models = list(LIVE_MODEL_FALLBACKS)
-        if LIVE_MODEL not in models:
-            models.insert(0, LIVE_MODEL)
+        models = self._ranked("live", LIVE_MODEL_FALLBACKS)
         last_err = None
         pcm_chunks: list[bytes] = []
 
-        for model in models:
+        for model in [m for m in models for _ in (0, 1)]:
+            if last_err is not None:
+                self._retry_pause(last_err)
             try:
                 config = {
                     "response_modalities": ["AUDIO"],
@@ -243,12 +244,12 @@ class VoiceEngine:
         from google.genai import types
 
         voice = self.voice_id()
-        models = list(TTS_MODEL_FALLBACKS)
-        if TTS_MODEL not in models:
-            models.insert(0, TTS_MODEL)
+        models = self._ranked("tts", TTS_MODEL_FALLBACKS)
         last_err = None
 
-        for model in models:
+        for model in [m for m in models for _ in (0, 1)]:
+            if last_err is not None:
+                self._retry_pause(last_err)
             # Skip known-flat lite models explicitly
             if "lite" in model or "3.1-flash-tts" in model:
                 continue
@@ -352,6 +353,36 @@ class VoiceEngine:
                 "engine": "offline",
                 "label": "Robotic offline (SAPI / pyttsx3) — last-resort fallback",
             }
+
+    # --- model ranking / failover ---
+
+    def _ranked(self, kind: str, fallback: list[str]) -> list[str]:
+        """Expressive TTS or Live models from models.list (cached), fallback list otherwise."""
+        names: list[str] = []
+        try:
+            if self._client is not None:
+                if not hasattr(self, "_catalog"):
+                    from pc_agent.core.models import ModelCatalog
+                    self._catalog = ModelCatalog(self._client)
+                names = self._catalog.names()
+        except Exception:
+            names = []
+        out: list[str] = []
+        for n in names:
+            low = n.lower()
+            if kind == "tts" and "tts" in low and "lite" not in low and "3.1-flash-tts" not in low:
+                out.append(n)
+            if kind == "live" and ("live" in low or "native-audio" in low):
+                out.append(n)
+        from pc_agent.core.models import _version_key
+        out = sorted(set(out), key=_version_key, reverse=True)
+        merged = list(dict.fromkeys(list(fallback) + out))
+        return merged
+
+    def _retry_pause(self, err) -> bool:
+        import time as _t
+        _t.sleep(0.5)
+        return True
 
     # --- audio helpers ---
 

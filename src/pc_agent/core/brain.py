@@ -6,7 +6,8 @@ import json
 import logging
 from typing import Any, Callable
 
-from pc_agent.config import DEFAULT_MODEL, EMBEDDING_MODEL, FALLBACK_MODELS, VERSION
+from pc_agent.config import DEFAULT_MODEL, EMBEDDING_MODEL, EMBEDDING_FALLBACKS, FALLBACK_MODELS, VERSION, load_config, save_config
+from pc_agent.core.models import ALL_FAILED_MSG, AllModelsFailed, ModelCatalog, ModelRouter
 
 logger = logging.getLogger("pc_agent.brain")
 
@@ -62,6 +63,40 @@ class Brain:
         self.tool_declarations = tool_declarations or []
         self.memory_context_fn = memory_context_fn
         self._history: list[Any] = []  # in-session Gemini contents
+        self.catalog = ModelCatalog(self.client)
+        self.router = ModelRouter("text", list(FALLBACK_MODELS), preferred=self.model,
+                                  on_switch=self._on_switch)
+        self.embed_router = ModelRouter("embed", list(EMBEDDING_FALLBACKS), preferred=EMBEDDING_MODEL)
+
+    def _on_switch(self, old: str, new: str) -> None:
+        self.model = new
+        logger.info("text model switched %s -> %s", old, new)
+        # Persist only when the configured model is gone (404); otherwise keep preferred
+        cfg = load_config()
+        if getattr(self, "_persist_switch", False):
+            cfg["model"] = new
+            save_config(cfg)
+            self._persist_switch = False
+
+    @property
+    def model_note(self) -> str:
+        return self.router.last_note or f"Using {self.router.current or self.model}"
+
+    def refresh_models(self, force: bool = False) -> None:
+        self.router.set_candidates(self.catalog.text_models(FALLBACK_MODELS))
+        self.embed_router.set_candidates(self.catalog.embedding_models(EMBEDDING_FALLBACKS))
+
+    def generate(self, contents, config=None):
+        """generate_content with automatic model failover. Raises AllModelsFailed."""
+        self.refresh_models()
+        def _call(model):
+            try:
+                return self.client.models.generate_content(model=model, contents=contents, config=config)
+            except Exception as exc:
+                if ("404" in str(exc) or "NOT_FOUND" in str(exc)) and model == self.router.preferred:
+                    self._persist_switch = True
+                raise
+        return self.router.call(_call)
 
     # --- model discovery ---
 
@@ -86,25 +121,22 @@ class Brain:
         return names
 
     def pick_model(self, preferred: str | None = None) -> str:
-        available = self.list_models()
-        if preferred and preferred in available:
+        ranked = self.catalog.text_models(FALLBACK_MODELS)
+        if preferred and preferred in ranked:
             self.model = preferred
-            return preferred
-        for cand in FALLBACK_MODELS:
-            if cand in available:
-                self.model = cand
-                return cand
-        if available:
-            self.model = available[0]
-            return self.model
-        self.model = preferred or DEFAULT_MODEL
+        elif ranked:
+            self.model = ranked[0]
+        else:
+            self.model = preferred or DEFAULT_MODEL
+        self.router.preferred = self.model
+        self.router.set_candidates(ranked)
+        self.router.current = self.model
         return self.model
 
     def embed(self, text: str) -> list[float] | None:
         try:
-            result = self.client.models.embed_content(
-                model=EMBEDDING_MODEL,
-                contents=text,
+            result = self.embed_router.call(
+                lambda m: self.client.models.embed_content(model=m, contents=text)
             )
             emb = getattr(result, "embeddings", None) or getattr(result, "embedding", None)
             if emb is None:
@@ -168,7 +200,8 @@ class Brain:
             parts.append(
                 types.Part.from_bytes(data=image_bytes, mime_type="image/png")
             )
-        self._history.append(types.Content(role="user", parts=parts))
+        user_msg = types.Content(role="user", parts=parts)
+        self._history.append(user_msg)
 
         tools = self._tools_config()
         config = types.GenerateContentConfig(
@@ -180,14 +213,14 @@ class Brain:
         max_rounds = 12
         for _ in range(max_rounds):
             try:
-                response = self.client.models.generate_content(
-                    model=self.model,
-                    contents=self._history,
-                    config=config,
-                )
-            except Exception as exc:
+                response = self.generate(self._history, config)
+            except AllModelsFailed:
+                if self._history and self._history[-1] is user_msg:
+                    self._history.pop()
+                return ALL_FAILED_MSG
+            except Exception:
                 logger.exception("generate_content failed")
-                return f"Model error: {exc}"
+                return "Something went wrong talking to the model. Try that again in a moment."
 
             candidate = response.candidates[0] if response.candidates else None
             if candidate is None:
@@ -248,11 +281,7 @@ class Brain:
         )
         try:
             types = self._types
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=prompt,
-                config=types.GenerateContentConfig(temperature=0.2),
-            )
+            response = self.generate(prompt, types.GenerateContentConfig(temperature=0.2))
             return (response.text or "").strip()
         except Exception as exc:
             logger.warning("summarize failed: %s", exc)

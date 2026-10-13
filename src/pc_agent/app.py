@@ -290,6 +290,7 @@ class Agent:
             set_key=self._set_key,
             halt_fn=lambda: safety.halt("ui"),
             resume_fn=safety.resume,
+            status_fn=lambda: (self.brain.model_note if self.brain else ""),
         )
         run_server(app, CHAT_HOST, CHAT_PORT)
         url = f"http://{CHAT_HOST}:{CHAT_PORT}/"

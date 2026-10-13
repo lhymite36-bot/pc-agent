@@ -9,17 +9,19 @@ from pathlib import Path
 
 APP_NAME = "PC Agent"
 APP_ID = "pc-agent"
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 
 # --- Brain ---
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.8-flash-lite",
     "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-2.5-flash-lite",
     "gemini-1.5-flash",
 ]
-EMBEDDING_MODEL = "text-embedding-004"
+EMBEDDING_MODEL = "gemini-embedding-001"
+EMBEDDING_FALLBACKS = ["gemini-embedding-001", "text-embedding-004"]
 
 # --- Voice (realistic / human by default) ---
 # Live native-audio is the default path (natural prosody, emotion, breaths, barge-in).
@@ -136,7 +138,7 @@ def load_config() -> dict:
     path = config_path()
     cfg = dict(DEFAULT_CONFIG)
     if path.exists():
-        with path.open("r", encoding="utf-8") as f:
+        with path.open("r", encoding="utf-8-sig") as f:
             cfg.update(json.load(f))
     return cfg
 

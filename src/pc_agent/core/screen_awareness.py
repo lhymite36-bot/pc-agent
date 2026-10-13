@@ -69,9 +69,7 @@ class ScreenAwareness:
             "Be factual."
         )
         try:
-            response = self.brain.client.models.generate_content(
-                model=self.brain.model,
-                contents=[
+            response = self.brain.generate([
                     types.Content(
                         role="user",
                         parts=[
@@ -79,9 +77,7 @@ class ScreenAwareness:
                             types.Part.from_bytes(data=data, mime_type="image/png"),
                         ],
                     )
-                ],
-                config=types.GenerateContentConfig(temperature=0.2),
-            )
+                ], types.GenerateContentConfig(temperature=0.2))
             self.last_summary = (response.text or "").strip()
             if self.on_update and self.last_summary:
                 self.on_update(self.last_summary)

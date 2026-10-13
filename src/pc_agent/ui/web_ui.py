@@ -73,6 +73,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
       <input id="chat-input" placeholder="Tell me what to do on this PC…" autofocus/>
       <button onclick="sendChat()">Send</button>
     </div>
+    <div id="model-note" class="muted" style="padding:0 16px 8px;font-size:11px;opacity:.7"></div>
   </section>
   <section id="view-memory" class="view">
     <div class="toolbar">
@@ -158,7 +159,8 @@ async function sendChat(){
   append('user', text); input.value='';
   const r = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
   const j = await r.json();
-  append('assistant', j.reply || j.error || '(no reply)');
+  append('assistant', j.reply || '(no reply)');
+  if (j.model_note) $('#model-note').textContent = j.model_note;
 }
 function append(role, text){
   const d = document.createElement('div');
@@ -233,6 +235,7 @@ async function saveKey(){
 }
 async function halt(){ await fetch('/api/halt', {method:'POST'}); alert('Agent halted. Resume from tray or restart.'); }
 loadSettings();
+fetch('/api/status').then(r=>r.json()).then(j=>{ if(j.model_note) $('#model-note').textContent=j.model_note; }).catch(()=>{});
 </script>
 </body>
 </html>
@@ -266,6 +269,7 @@ def create_app(
     set_key: Callable[[str], None],
     halt_fn: Callable[[], None],
     resume_fn: Callable[[], None] | None = None,
+    status_fn: Callable[[], str] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="PC Agent")
 
@@ -277,10 +281,15 @@ def create_app(
     def api_chat(body: ChatIn) -> dict:
         try:
             reply = chat_fn(body.text)
-            return {"reply": reply}
-        except Exception as exc:
+            return {"reply": reply, "model_note": status_fn() if status_fn else ""}
+        except Exception:
             logger.exception("chat failed")
-            return {"error": str(exc)}
+            return {"reply": "Something went wrong on my side. Try again in a moment.",
+                    "model_note": status_fn() if status_fn else ""}
+
+    @app.get("/api/status")
+    def api_status() -> dict:
+        return {"model_note": status_fn() if status_fn else ""}
 
     @app.get("/api/memory")
     def api_memory(q: str = "", kind: str = "") -> dict:
