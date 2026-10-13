@@ -52,18 +52,22 @@ def confirm(category: str, description: str) -> bool:
         return False
     if not needs_confirmation(category):
         return True
+    approved = False
     cb = _confirm_callback
-    if cb is None:
-        # Headless / tests: deny by default for safety.
-        logger.warning("No confirm UI; denying %s: %s", category, description)
-        log_action(category, "denied_no_ui", {"description": description}, ok=False)
-        return False
-    try:
-        approved = bool(cb(category, description))
-    except Exception as exc:
-        logger.exception("Confirm callback failed")
-        log_action(category, "confirm_error", {"error": str(exc)}, ok=False)
-        return False
+    if cb is not None:
+        try:
+            approved = bool(cb(category, description))
+        except Exception as exc:
+            logger.exception("Confirm callback failed")
+            log_action(category, "confirm_error", {"error": str(exc)}, ok=False)
+            return False
+    else:
+        # Native Windows MessageBox when no callback is registered.
+        approved = _native_confirm(category, description)
+        if approved is None:
+            logger.warning("No confirm UI; denying %s: %s", category, description)
+            log_action(category, "denied_no_ui", {"description": description}, ok=False)
+            return False
     log_action(
         category,
         "confirm",
@@ -71,6 +75,28 @@ def confirm(category: str, description: str) -> bool:
         ok=approved,
     )
     return approved
+
+
+def _native_confirm(category: str, description: str) -> bool | None:
+    """Windows MessageBox; None if unavailable (Linux / headless)."""
+    try:
+        import ctypes
+        import sys
+
+        if sys.platform != "win32":
+            return None
+        MB_YESNO = 0x04
+        MB_ICONWARNING = 0x30
+        MB_TOPMOST = 0x40000
+        result = ctypes.windll.user32.MessageBoxW(
+            0,
+            f"{description}\n\nCategory: {category}\n\nAllow this action?",
+            "PC Agent — confirmation needed",
+            MB_YESNO | MB_ICONWARNING | MB_TOPMOST,
+        )
+        return result == 6  # IDYES
+    except Exception:
+        return None
 
 
 def log_action(category: str, action: str, details: dict, ok: bool = True) -> None:
