@@ -33,6 +33,13 @@ Dangerous actions (delete, install, send message/email, payments, registry, shut
 ### Automatic model failover
 A ranked list of good text models is built from `models.list` (cached ~3 h): newest flash first, then pro, then other flash — no lite/TTS/embedding/image/Veo/Live. On 503/429/404/500 it retries once, then silently moves to the next model, sticks with the working one for 15 min, then tries the preferred model again. A 404 on the configured model saves the replacement to config. The UI shows a tiny “Using <model>” note; if everything fails you get a friendly message, never a raw error. Vision, planner, screen awareness, summaries and embeddings share the same failover; TTS and Live voice walk their own expressive model lists, then SAPI.
 
+### Terminal mode (1.0.6)
+- **Atlas (Terminal)** Start Menu shortcut → `AtlasCLI.exe` (console), or `PCAgent.exe --cli`.
+- Streaming text chat in the terminal (rich). Same brain, tools, memory, failover, safety.
+- Native mic/speakers via **sounddevice** (PortAudio bundled). Enter toggles push-to-talk; `/voice` for hands-free Gemini Live; falls back to STT→chat→TTS→SAPI.
+- Commands: `/voice` `/text` `/mic` `/model` `/memory` `/quit`. Confirms are `y/N` in the terminal; Ctrl+Alt+Esc still kills actions.
+- Safe alongside the tray/web app: SQLite **WAL** mode. CI runs `AtlasCLI.exe --selftest` on Windows.
+
 ### Reliability (1.0.5)
 - Hard timeouts: ~10 s to first token, ~60 s total stream — then cancel and fail over.
 - Network errors (`RemoteProtocolError`, timeouts, disconnects) cool the model and fail over.

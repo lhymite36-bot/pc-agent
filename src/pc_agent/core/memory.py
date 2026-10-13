@@ -63,8 +63,14 @@ class MemoryStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._embed_fn: Callable[[str], list[float] | None] | None = None
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        self._conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=30)
         self._conn.row_factory = sqlite3.Row
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
         self._init_schema()
 
     def set_embedder(self, fn: Callable[[str], list[float] | None] | None) -> None:

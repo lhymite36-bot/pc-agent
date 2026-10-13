@@ -482,6 +482,8 @@ def _shorten_for_speech(text: str, max_chars: int = 400) -> str:
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="PC Agent — always-on desktop agent")
     parser.add_argument("--no-browser", action="store_true")
+    parser.add_argument("--cli", action="store_true", help="Run Atlas in the terminal (text + mic).")
+    parser.add_argument("--selftest", action="store_true", help="CLI smoke test (imports/audio/config).")
     parser.add_argument("--version", action="store_true")
     parser.add_argument(
         "--watchdog",
@@ -492,6 +494,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.version:
         print(__version__)
         return
+    if args.selftest or args.cli:
+        from pc_agent.cli import run_cli
+        raise SystemExit(run_cli(["--selftest"] if args.selftest else []))
     if args.watchdog:
         _watchdog()
         return

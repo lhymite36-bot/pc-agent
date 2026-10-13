@@ -1,8 +1,9 @@
 ; Inno Setup script for PC Agent
 #define MyAppName "PC Agent"
-#define MyAppVersion "1.0.5"
+#define MyAppVersion "1.0.6"
 #define MyAppPublisher "Pedro"
 #define MyAppExeName "PCAgent.exe"
+#define MyCliExeName "AtlasCLI.exe"
 
 [Setup]
 AppId={{A7C3E9D1-4B2F-4E8A-9C11-PCAGENT0001}
@@ -31,8 +32,11 @@ Source: "..\dist\PCAgent\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdi
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\Atlas (Terminal)"; Filename: "{app}\{#MyCliExeName}"; Comment: "Atlas in your terminal with mic voice"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autodesktop}\Atlas (Terminal)"; Filename: "{app}\{#MyCliExeName}"; Tasks: desktopicon
 Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Parameters: "--no-browser"; Tasks: autostart
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch PC Agent"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#MyCliExeName}"; Description: "Launch Atlas (Terminal)"; Flags: nowait postinstall skipifsilent unchecked
