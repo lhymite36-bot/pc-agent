@@ -194,6 +194,18 @@ class Agent:
                 self._init_brain()
                 self.bootstrap_tools_only()
 
+            # $0 offline fast-path (also works when Gemini quota is empty)
+            try:
+                from pc_agent.core.offline_router import try_handle
+                offline = try_handle(text)
+            except Exception:
+                offline = None
+            if offline is not None:
+                self.memory.add_message("user", text)
+                self.memory.add_message("assistant", offline)
+                yield offline
+                return
+
             self.memory.add_message("user", text)
 
             image = None

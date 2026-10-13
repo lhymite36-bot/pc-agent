@@ -171,12 +171,15 @@ class TerminalApp:
                 "  /text           Text mode (default)\n"
                 "  Enter (empty)   Toggle push-to-talk in text mode\n"
                 "  /mic            List audio devices\n"
-                "  /mic in N       Select input device N\n"
-                "  /mic out N      Select output device N\n"
-                "  /model          Show current model\n"
-                "  /model NAME     Prefer model NAME (saved)\n"
+                "  /mic in|out N   Select device\n"
+                "  /model [NAME]   Show / prefer Gemini model\n"
+                "  /keys           List API keys (rotation)\n"
+                "  /keys add KEY   Add another free Gemini API key\n"
+                "  /keys rotate    Switch to the next key\n"
                 "  /memory [q]     Search / list memories\n"
-                "  /quit /exit     Leave the terminal\n"
+                "  /ollama         Check local Ollama fallback\n"
+                "  /quit           Leave\n"
+                "Offline (no quota): open chrome/notepad/downloads, volume, screenshot, lock, time…\n"
             )
             return True
         if cmd == "/voice":
@@ -195,6 +198,12 @@ class TerminalApp:
             return True
         if cmd == "/memory":
             self.cmd_memory(arg)
+            return True
+        if cmd == "/keys":
+            self.cmd_keys(arg)
+            return True
+        if cmd == "/ollama":
+            self.cmd_ollama()
             return True
         if cmd.startswith("/"):
             self.print(f"Unknown command: {cmd}  (try /help)")
@@ -268,22 +277,62 @@ class TerminalApp:
         self.print(f"[bold green]You[/bold green] {text}" if self._console else f"You: {text}")
         name = (self.cfg.get("agent_name") or "Atlas")
         prefix = f"[bold cyan]{name}[/bold cyan] " if self._console else f"{name}: "
+
+        # Fast offline path — $0, instant
+        from pc_agent.core.offline_router import try_handle
+        offline = try_handle(text)
+        if offline is not None:
+            if self._console:
+                self._console.print(prefix, end="")
+                self._console.print(offline)
+            else:
+                print(prefix + offline)
+            self._speak_free(offline)
+            self.agent.memory.add_message("user", text)
+            self.agent.memory.add_message("assistant", offline)
+            return
+
         if self._console:
             self._console.print(prefix, end="")
         else:
             print(prefix, end="", flush=True)
+        reply_parts: list[str] = []
         try:
             for delta in self.agent.chat_stream(text):
+                reply_parts.append(delta)
                 if self._console:
                     self._console.print(delta, end="", highlight=False)
                 else:
                     print(delta, end="", flush=True)
         except Exception:
             logger.exception("chat failed")
-            msg = "Something went wrong. Try again."
-            self.print(msg)
-            return
+            reply_parts = []
+        reply = "".join(reply_parts)
         print()
+
+        # If Gemini is out, try Ollama, then offline apology with tips
+        from pc_agent.core.quota import is_quota_exhausted, format_quota_notice, model_reset_map
+        if (not reply) or is_quota_exhausted(reply) or reply.startswith("All the Gemini"):
+            local = self._ollama_chat(text)
+            if local:
+                self.print(f"\n[dim](local Ollama)[/dim] {local}" if self._console else f"\n(local Ollama) {local}")
+                self._speak_free(local)
+                return
+            if is_quota_exhausted(reply) or (reply or "").startswith("All the Gemini"):
+                # Enrich notice with per-model resets; strip any old billing wording
+                health = getattr(getattr(self.agent, "brain", None), "health", None)
+                resets = model_reset_map(health) if health else None
+                notice = format_quota_notice(reply or "429", model_resets=resets)
+                if reply and reply != notice:
+                    # Replace the streamed quota line visually
+                    pass
+                self.print(f"[dim]{notice}[/dim]" if self._console else notice)
+                tip = try_handle("what time is it")  # sanity
+                self.status("Tip: try “open chrome”, “open downloads”, “screenshot”, “volume mute”.")
+                self._speak_free("I'm on free offline mode for a bit. Try opening an app or asking for the time.")
+                return
+        if reply:
+            self._speak_free(reply)
 
     # --- push-to-talk ---
 
@@ -498,6 +547,99 @@ class TerminalApp:
             self._live = None
         self.mode = "text"
 
+
+    def _speak_free(self, text: str) -> None:
+        """Default CLI voice: edge-tts or SAPI — not Gemini (saves quota, starts fast)."""
+        from pc_agent.config import load_config
+        if not load_config().get("voice_enabled", True):
+            return
+        # Shorten for speech
+        spoken = text.strip()
+        if len(spoken) > 400:
+            spoken = spoken[:400].rsplit(" ", 1)[0] + "…"
+        def _run():
+            try:
+                from pc_agent.core.free_tts import speak_free
+                from pc_agent.core.terminal_audio import Speaker
+                if self._speaker is None:
+                    self._speaker = Speaker(device=self.spk_device)
+                spk = self._speaker
+                def on_chunk(pcm: bytes):
+                    try:
+                        spk.write(pcm)
+                    except Exception:
+                        pass
+                # Prefer SAPI for sub-second start; edge-tts if configured
+                mode = load_config().get("cli_tts", "sapi")  # sapi | edge
+                if mode == "edge":
+                    speak_free(spoken, on_chunk=None)
+                else:
+                    from pc_agent.core.free_tts import _speak_sapi
+                    _speak_sapi(spoken)
+            except Exception:
+                logger.exception("free tts failed")
+        threading.Thread(target=_run, name="cli-tts", daemon=True).start()
+
+    def _ollama_chat(self, text: str) -> str:
+        try:
+            from pc_agent.core import ollama as ol
+            ok, models = ol.available()
+            if not ok:
+                return ""
+            self.status("Gemini quota empty — trying local Ollama…")
+            msgs = [
+                {"role": "system", "content": "You are Atlas, a concise PC helper. Be brief."},
+                {"role": "user", "content": text},
+            ]
+            return ol.chat(msgs)
+        except Exception as exc:
+            logger.info("ollama fallback skipped: %s", exc)
+            return ""
+
+    def cmd_keys(self, arg: str) -> None:
+        from pc_agent.core import keys as keystore
+        arg = (arg or "").strip()
+        if not arg:
+            rows = keystore.list_status()
+            if not rows:
+                self.print("No API keys yet. Add one with: /keys add AIza…")
+                return
+            for r in rows:
+                flag = "*" if r["active"] else " "
+                cool = f"  cooling until {r['reset_local']} local" if r["cooling"] else ""
+                self.print(f" {flag} {r['id']:10} {r['hint']}{cool}")
+            return
+        if arg.startswith("add "):
+            secret = arg[4:].strip()
+            info = keystore.add_key(secret)
+            self.print(f"Added {info['id']} ({info['hint']})")
+            # Re-init brain with new active key
+            try:
+                self.agent._set_key(keystore.active_key() or secret)
+            except Exception:
+                pass
+            return
+        if arg == "rotate":
+            k = keystore.rotate()
+            self.print("Rotated." if k else "No other key available.")
+            if k:
+                try:
+                    self.agent._set_key(k)
+                except Exception:
+                    pass
+            return
+        self.print("Usage: /keys | /keys add AIza… | /keys rotate")
+
+    def cmd_ollama(self) -> None:
+        from pc_agent.core import ollama as ol
+        ok, models = ol.available()
+        if not ok:
+            self.print("Ollama not detected at localhost:11434.")
+            self.print("Optional free local brain:  ollama pull llama3.2:3b")
+            return
+        pick = ol.pick_model(models)
+        self.print(f"Ollama OK · {len(models)} model(s) · will use {pick}")
+
     def shutdown(self) -> None:
         self.stop_voice_mode()
         if self._speaker:
@@ -556,10 +698,10 @@ def run_cli(argv: list[str] | None = None) -> int:
         return selftest()
 
     # Full agent without web UI (safe alongside tray if already on :8765)
-    from pc_agent.app import Agent, _setup_logging
+    from pc_agent.app import Agent
     from pc_agent.config import get_api_key
 
-    _setup_logging()
+    _setup_cli_logging()
     agent = Agent()
     # Bootstrap brain/tools/scheduler but do NOT bind the web port
     agent.bootstrap()

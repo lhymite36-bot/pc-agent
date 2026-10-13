@@ -12,8 +12,10 @@ def test_parse_retry_hours():
 def test_quota_notice_local_time():
     msg = quota.format_quota_notice("429 RESOURCE_EXHAUSTED free_tier retry in 3600s")
     assert "Free Gemini quota is used up until about" in msg
-    assert "billing" in msg.lower()
+    assert "billing" not in msg.lower()
     assert "local" in msg
+    msg2 = quota.format_quota_notice("429", model_resets={"gemini-3.6-flash": 3600})
+    assert "gemini-3.6-flash" in msg2
 
 
 def test_is_quota_exhausted():

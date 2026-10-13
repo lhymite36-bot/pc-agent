@@ -33,10 +33,21 @@ Dangerous actions (delete, install, send message/email, payments, registry, shut
 ### Automatic model failover
 A ranked list of good text models is built from `models.list` (cached ~3 h): newest flash first, then pro, then other flash — no lite/TTS/embedding/image/Veo/Live. On 503/429/404/500 it retries once, then silently moves to the next model, sticks with the working one for 15 min, then tries the preferred model again. A 404 on the configured model saves the replacement to config. The UI shows a tiny “Using <model>” note; if everything fails you get a friendly message, never a raw error. Vision, planner, screen awareness, summaries and embeddings share the same failover; TTS and Live voice walk their own expressive model lists, then SAPI.
 
+### Free / $0 mode (1.0.8)
+- **Offline command router** (no model): open apps/folders/URLs, volume, screenshot, lock, system info, time — used as a fast path and when Gemini is out.
+- **CLI voice is free & fast by default**: Windows SAPI (under ~1s); optional `edge-tts` neural voices. Gemini TTS is opt-in only.
+- **Multi-key rotation**: `/keys add AIza…` then `/keys rotate`. Exhausted keys cool until their reset time (shown in local time).
+- **CLI logs** go to `agent.log`; the console only shows warnings so chat stays clean.
+- **Optional Ollama**: if something is listening at `localhost:11434`, Atlas uses it when Gemini quota is empty.
+  ```bash
+  ollama pull llama3.2:3b
+  ```
+- No billing prompts — designed for $0.
+
 ### Offline STT + quota (1.0.7)
 - **Local STT by default** (faster-whisper `base` int8 on CPU; model downloads once into the data dir). No free-tier quota spent on transcription.
 - 429s fail over across flash models with `retryDelay` cooldowns (persisted). Live / TTS / chat share the same health store.
-- Clear one-line notice when free quota is gone (local reset time + billing hint); replies fall back to Windows SAPI.
+- Clear one-line notice when free quota is gone (local reset time); replies fall back to Windows SAPI.
 - Memory extraction stays heuristic; embeddings/summaries are batched rarely and never call Gemini for summaries.
 - Installer upgrades while the app is running: AppMutex, CloseApplications, and `taskkill` of PCAgent/AtlasCLI before copy.
 

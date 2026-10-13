@@ -83,17 +83,20 @@ def _trim_history(history: list[Any], limit: int = MAX_HISTORY_CONTENTS) -> list
 
 
 
-def _make_client(api_key: str):
+def _make_client(api_key: str | None = None):
     """Gemini client with SDK retries disabled and bounded HTTP timeouts."""
     from google import genai
     from google.genai import types
+    from pc_agent.core.keys import active_key
 
-    # timeout is milliseconds for the google-genai HttpOptions
+    key = api_key or active_key()
+    if not key:
+        raise RuntimeError("No Gemini API key")
     http = types.HttpOptions(
         timeout=int(STREAM_TOTAL_TIMEOUT_SEC * 1000),
-        retry_options=types.HttpRetryOptions(attempts=1),  # single try; we own failover
+        retry_options=types.HttpRetryOptions(attempts=1),
     )
-    return genai.Client(api_key=api_key, http_options=http)
+    return genai.Client(api_key=key, http_options=http)
 
 
 class Brain:
@@ -415,14 +418,30 @@ class Brain:
                 if self._history and self._history[-1] is user_msg:
                     self._history.pop()
                 try:
-                    from pc_agent.core.quota import format_quota_notice, is_quota_exhausted
+                    from pc_agent.core.quota import (
+                        format_quota_notice,
+                        is_quota_exhausted,
+                        model_reset_map,
+                        parse_retry_seconds,
+                    )
+                    from pc_agent.core.keys import mark_quota, rotate, active_key
                     if is_quota_exhausted(exc):
+                        secs = parse_retry_seconds(exc) or 3600
+                        try:
+                            mark_quota(None, secs)
+                            new_key = rotate()
+                            if new_key:
+                                self.client = _make_client(new_key)
+                                self.refresh_models()
+                                logger.info("Rotated API key after quota; will use it next turn")
+                        except Exception:
+                            logger.debug("key rotate failed", exc_info=True)
                         from pc_agent.config import load_config, save_config
                         cfg = load_config()
                         if cfg.get("voice_mode") != "offline":
                             cfg["voice_mode"] = "offline"
                             save_config(cfg)
-                        yield format_quota_notice(exc)
+                        yield format_quota_notice(exc, model_resets=model_reset_map(self.health))
                     else:
                         yield ALL_FAILED_MSG
                 except Exception:

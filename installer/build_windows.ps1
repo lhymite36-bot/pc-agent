@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 python -m pip install -U pip
 pip install -e ".[windows,voice]"
-pip install pyinstaller pyttsx3 pywin32 sounddevice rich numpy faster-whisper
+pip install pyinstaller pyttsx3 pywin32 sounddevice rich numpy faster-whisper edge-tts
 
 $common = @(
   "--noconfirm", "--clean",
