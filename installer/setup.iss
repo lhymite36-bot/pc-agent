@@ -34,7 +34,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "autostart"; Description: "Start PC Agent when Windows starts"; GroupDescription: "Startup:"; Flags: checkedonce
 
 [Files]
-Source: "..\dist\PCAgent\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs closeonexit
+Source: "..\dist\PCAgent\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
