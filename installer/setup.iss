@@ -1,6 +1,6 @@
 ; Inno Setup script for PC Agent / Atlas
 #define MyAppName "PC Agent"
-#define MyAppVersion "1.0.8"
+#define MyAppVersion "1.0.9"
 #define MyAppPublisher "Pedro"
 #define MyAppExeName "PCAgent.exe"
 #define MyCliExeName "AtlasCLI.exe"

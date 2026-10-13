@@ -64,6 +64,14 @@ Get-ChildItem "dist/PCAgent_cli_build/AtlasCLI" -Directory | ForEach-Object {
 & "dist/PCAgent/AtlasCLI.exe" --selftest
 if ($LASTEXITCODE -ne 0) { throw "AtlasCLI --selftest failed with $LASTEXITCODE" }
 
+# Real startup smoke: no key, no network, stdin "/quit" must exit 0
+$env:PC_AGENT_NO_AUTOSTART = "1"
+$p = Start-Process -FilePath "dist/PCAgent/AtlasCLI.exe" -NoNewWindow -PassThru -Wait `
+  -RedirectStandardInput "installer/quit.txt" -RedirectStandardOutput "dist/cli_quit_out.txt" -RedirectStandardError "dist/cli_quit_err.txt"
+Get-Content dist/cli_quit_out.txt, dist/cli_quit_err.txt -ErrorAction SilentlyContinue
+if ($p.ExitCode -ne 0) { throw "AtlasCLI '/quit' smoke failed with exit $($p.ExitCode)" }
+Write-Host "AtlasCLI /quit smoke OK"
+
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\setup.iss
 if (-not (Test-Path "dist/PCAgent-Setup.exe")) { throw "Installer missing" }
 Write-Host "Build OK"

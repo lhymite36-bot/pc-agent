@@ -683,6 +683,27 @@ class TerminalApp:
                 self.chat_line(stripped)
 
 
+def _setup_cli_logging() -> None:
+    """CLI: INFO+ to file only; console shows WARNING+ so chat stays clean."""
+    from logging.handlers import RotatingFileHandler
+    from pc_agent.config import data_dir
+
+    root = logging.getLogger()
+    for h in list(root.handlers):
+        root.removeHandler(h)
+    root.setLevel(logging.INFO)
+    fh = RotatingFileHandler(data_dir() / "agent.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+    root.addHandler(fh)
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.WARNING)
+    sh.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
+    root.addHandler(sh)
+    for noisy in ("httpx", "httpcore", "google_genai.models", "uvicorn.access"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 def run_cli(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="AtlasCLI", description="Atlas terminal agent")
     parser.add_argument("--selftest", action="store_true", help="Smoke-test imports/audio/config and exit")
@@ -719,7 +740,27 @@ def run_cli(argv: list[str] | None = None) -> int:
 
 
 def main(argv: list[str] | None = None) -> None:
-    raise SystemExit(run_cli(argv))
+    """Never let the console window just vanish on a crash."""
+    try:
+        code = run_cli(argv)
+    except SystemExit as exc:
+        code = exc.code if isinstance(exc.code, int) else 0
+    except BaseException:
+        import traceback
+
+        traceback.print_exc()
+        try:
+            from pc_agent.config import data_dir
+            print(f"\nAtlas crashed. Details are in {data_dir() / 'agent.log'}")
+        except Exception:
+            print("\nAtlas crashed.")
+        code = 1
+    if code and sys.stdin is not None and sys.stdin.isatty():
+        try:
+            input("Press Enter to close")
+        except Exception:
+            pass
+    raise SystemExit(code)
 
 
 if __name__ == "__main__":

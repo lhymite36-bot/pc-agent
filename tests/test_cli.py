@@ -51,3 +51,12 @@ def test_terminal_commands_no_crash(tmp_path, monkeypatch):
     assert app.handle_command("/nope") is True
     # not a command
     assert app.handle_command("hello") is False
+
+
+def test_cli_starts_and_quits_without_key(tmp_path):
+    import os, subprocess, sys
+    env = dict(os.environ, XDG_DATA_HOME=str(tmp_path))
+    r = subprocess.run([sys.executable, "-m", "pc_agent.cli_main"], input="/quit\n",
+                       capture_output=True, text=True, timeout=60, env=env)
+    assert r.returncode == 0, r.stderr
+    assert "Bye." in r.stdout
