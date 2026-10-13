@@ -33,6 +33,13 @@ Dangerous actions (delete, install, send message/email, payments, registry, shut
 ### Automatic model failover
 A ranked list of good text models is built from `models.list` (cached ~3 h): newest flash first, then pro, then other flash — no lite/TTS/embedding/image/Veo/Live. On 503/429/404/500 it retries once, then silently moves to the next model, sticks with the working one for 15 min, then tries the preferred model again. A 404 on the configured model saves the replacement to config. The UI shows a tiny “Using <model>” note; if everything fails you get a friendly message, never a raw error. Vision, planner, screen awareness, summaries and embeddings share the same failover; TTS and Live voice walk their own expressive model lists, then SAPI.
 
+### Voice UI (1.0.4)
+- Large **Talk** mic button next to the chat input (click-to-talk and hold-to-talk).
+- **Voice mode: On/Off** switch on the Chat page for hands-free Gemini Live (falls back to STT→chat→TTS).
+- Browser `getUserMedia` mic → WebSocket → agent; playback in the browser (no extra Python audio deps required).
+- Voice tab: on/off + **Test voice**. Tray **Voice mode** item and **Ctrl+Alt+Space** hotkey.
+- PyInstaller collects `pc_agent.core.voice`, `live_session`, `voice_hub`, `hotkeys`.
+
 ### Speed (1.0.3)
 - Replies stream into the chat window token by token, and speech starts sentence by sentence.
 - Normal chat uses minimal thinking; the planner uses high thinking.

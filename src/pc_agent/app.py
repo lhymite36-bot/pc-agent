@@ -32,7 +32,9 @@ from pc_agent.tools import build_tooling
 from pc_agent.tools.screen import load_last_screenshot_bytes, take_screenshot
 from pc_agent.ui.telegram_bot import TelegramBridge
 from pc_agent.ui.tray import start_tray
+from pc_agent.ui.voice_hub import VoiceHub
 from pc_agent.ui.web_ui import create_app, run_server
+from pc_agent.core.hotkeys import start_voice_hotkey, stop_voice_hotkey
 
 def _setup_logging() -> None:
     from logging.handlers import RotatingFileHandler
@@ -69,6 +71,12 @@ class Agent:
         self._confirm_results: dict[str, bool] = {}
         self._lock = threading.RLock()
         self._start_workers()
+        self._voice_mode = False
+        self.voice_hub = VoiceHub(
+            api_key_fn=get_api_key,
+            chat_fn=self.chat,
+            voice_engine_fn=lambda: self.voice,
+        )
 
     def bootstrap(self) -> None:
         if not self.api_key:
@@ -348,6 +356,7 @@ class Agent:
             resume_fn=safety.resume,
             status_fn=lambda: (self.brain.model_note if self.brain else ""),
             stream_fn=self.chat_stream,
+            voice_hub=self.voice_hub,
         )
         run_server(app, CHAT_HOST, CHAT_PORT)
         url = f"http://{CHAT_HOST}:{CHAT_PORT}/"
@@ -360,7 +369,10 @@ class Agent:
             halt=lambda: safety.halt("tray"),
             resume=safety.resume,
             quit_app=self.shutdown,
+            toggle_voice=self.toggle_voice_mode,
+            voice_is_on=lambda: self._voice_mode,
         )
+        start_voice_hotkey(self.toggle_voice_mode)
         logger.info("PC Agent v%s listening at %s", __version__, url)
         if open_browser:
             try:
@@ -381,6 +393,16 @@ class Agent:
         self._init_brain()
         self.bootstrap_tools_only()
 
+    def toggle_voice_mode(self) -> None:
+        """Ctrl+Alt+Space / tray: open UI and flip Voice mode."""
+        self._voice_mode = not self._voice_mode
+        self.voice_hub.set_mode(self._voice_mode)
+        try:
+            webbrowser.open(f"http://{CHAT_HOST}:{CHAT_PORT}/?voice={'1' if self._voice_mode else '0'}")
+        except Exception:
+            pass
+        logger.info("Voice mode %s", "ON" if self._voice_mode else "OFF")
+
     def shutdown(self) -> None:
         if self.scheduler:
             self.scheduler.stop()
@@ -389,6 +411,7 @@ class Agent:
         if self.tg:
             self.tg.stop()
         safety.stop_kill_switch()
+        stop_voice_hotkey()
         self.memory.close()
         sys.exit(0)
 

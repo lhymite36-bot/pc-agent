@@ -20,6 +20,11 @@ pyinstaller --noconfirm --clean `
   --hidden-import=uvicorn.protocols.websockets.auto `
   --hidden-import=uvicorn.lifespan `
   --hidden-import=uvicorn.lifespan.on `
+  --hidden-import=pc_agent.core.voice `
+  --hidden-import=pc_agent.core.live_session `
+  --hidden-import=pc_agent.ui.voice_hub `
+  --hidden-import=pc_agent.core.hotkeys `
+  --collect-submodules pc_agent `
   src/pc_agent/__main__.py
 
 if (-not (Test-Path "dist/PCAgent/PCAgent.exe")) { throw "PyInstaller output missing" }

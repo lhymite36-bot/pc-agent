@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import webbrowser
 from typing import Callable
 
 logger = logging.getLogger("pc_agent.tray")
@@ -15,6 +14,8 @@ def start_tray(
     halt: Callable[[], None],
     resume: Callable[[], None],
     quit_app: Callable[[], None],
+    toggle_voice: Callable[[], None] | None = None,
+    voice_is_on: Callable[[], bool] | None = None,
 ) -> threading.Thread | None:
     try:
         import pystray
@@ -39,18 +40,28 @@ def start_tray(
     def on_resume(icon, item):  # noqa: ARG001
         resume()
 
+    def on_voice(icon, item):  # noqa: ARG001
+        if toggle_voice:
+            toggle_voice()
+
     def on_quit(icon, item):  # noqa: ARG001
         quit_app()
         icon.stop()
 
-    menu = pystray.Menu(
+    def voice_checked(item):  # noqa: ARG001
+        return bool(voice_is_on and voice_is_on())
+
+    items = [
         pystray.MenuItem("Open chat", on_open, default=True),
+    ]
+    if toggle_voice:
+        items.append(pystray.MenuItem("Voice mode", on_voice, checked=voice_checked))
+    items.extend([
         pystray.MenuItem("Halt (kill switch)", on_halt),
         pystray.MenuItem("Resume", on_resume),
         pystray.MenuItem("Quit", on_quit),
-    )
-    icon = pystray.Icon("pc-agent", _icon_image(), "PC Agent", menu)
-
+    ])
+    icon = pystray.Icon("pc-agent", _icon_image(), "PC Agent", pystray.Menu(*items))
     t = threading.Thread(target=icon.run, name="pc-agent-tray", daemon=True)
     t.start()
     return t

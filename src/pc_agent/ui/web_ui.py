@@ -7,7 +7,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 import json as _json
 from pydantic import BaseModel
@@ -54,6 +54,16 @@ INDEX_HTML = r"""<!DOCTYPE html>
   .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
   .pill { display:inline-block; padding:2px 8px; border-radius:999px; background:#243044; font-size:12px; }
   .pill.warn { background:#4a3020; color:#ffb070; }
+
+  .chat-top { display:flex; align-items:center; gap:12px; padding:12px 16px; border-bottom:1px solid #2a3344; }
+  .switch { display:inline-flex; align-items:center; gap:8px; cursor:pointer; user-select:none; }
+  .switch input { accent-color: var(--accent); width:18px; height:18px; }
+  #mic-btn { width:56px; height:56px; border-radius:50%; border:0; background:#2a3344; color:var(--ink);
+    font-size:22px; cursor:pointer; flex-shrink:0; display:flex; align-items:center; justify-content:center; }
+  #mic-btn.listening { background:#e74c3c; color:#fff; box-shadow:0 0 0 4px rgba(231,76,60,.35); }
+  #mic-btn.busy { opacity:.6; }
+  #voice-status { font-size:12px; color:var(--muted); min-height:16px; padding:0 16px 4px; }
+  .composer { align-items:center; }
 </style>
 </head>
 <body>
@@ -69,8 +79,20 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </nav>
 <main>
   <section id="view-chat" class="view active">
+    <div class="chat-top">
+      <label class="switch" title="Hands-free conversation with Gemini Live">
+        <input type="checkbox" id="voice-mode-toggle" onchange="setVoiceMode(this.checked)"/>
+        <span>Voice mode: <strong id="voice-mode-label">Off</strong></span>
+      </label>
+      <span id="voice-engine-pill" class="pill" style="display:none"></span>
+      <div style="flex:1"></div>
+      <span class="muted" style="font-size:12px">Mic runs in this browser · Ctrl+Alt+Space</span>
+    </div>
     <div id="chat-log"></div>
+    <div id="voice-status"></div>
     <div class="composer">
+      <button id="mic-btn" type="button" title="Click to talk · Hold for push-to-talk"
+        aria-label="Talk">🎤</button>
       <input id="chat-input" placeholder="Tell me what to do on this PC…" autofocus/>
       <button onclick="sendChat()">Send</button>
     </div>
@@ -95,8 +117,14 @@ INDEX_HTML = r"""<!DOCTYPE html>
   <section id="view-voice" class="view">
     <div class="card">
       <h2 style="margin-top:0">Voice</h2>
-      <p class="muted">Default is Gemini Live native-audio — natural prosody, emotion, breaths, interruptions. TTS is the expressive non-live path. Offline SAPI is robotic and last-resort only.</p>
-      <label>Mode</label>
+      <p class="muted">Default is Gemini Live native-audio — natural prosody, emotion, breaths, interruptions. TTS is the expressive non-live path. Offline SAPI is robotic and last-resort only. The mic in Chat captures audio in this browser (no extra install).</p>
+      <div class="row" style="margin-bottom:12px">
+        <label class="switch"><input type="checkbox" id="voice-enabled" onchange="saveVoice()"/> <span>Speak replies aloud: <strong id="voice-enabled-label">On</strong></span></label>
+        <button class="btn" type="button" onclick="testSpeak()">Test voice</button>
+        <button class="btn ghost" type="button" onclick="setVoiceMode(true)">Start Voice mode</button>
+        <button class="btn ghost" type="button" onclick="setVoiceMode(false)">Stop Voice mode</button>
+      </div>
+      <label>Engine</label>
       <select id="voice-mode" onchange="saveVoice()">
         <option value="live">Live native-audio (default, most human)</option>
         <option value="tts">Expressive Gemini TTS</option>
@@ -104,9 +132,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
       </select>
       <label>Voice</label>
       <div id="voice-list"></div>
-      <div class="row" style="margin-top:12px">
-        <label><input type="checkbox" id="voice-enabled" onchange="saveVoice()"/> Speak replies aloud</label>
-      </div>
     </div>
   </section>
   <section id="view-settings" class="view">
@@ -204,7 +229,7 @@ async function forgetMem(id){
 function escapeHtml(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 async function loadVoice(){
   const r = await fetch('/api/voice'); const j = await r.json();
-  $('#voice-mode').value = j.mode; $('#voice-enabled').checked = !!j.enabled;
+  $('#voice-mode').value = j.mode; $('#voice-enabled').checked = !!j.enabled; $('#voice-enabled-label').textContent = j.enabled ? 'On' : 'Off';
   const list = $('#voice-list'); list.innerHTML='';
   (j.catalog||[]).forEach(v => {
     const row = document.createElement('div'); row.className='row'; row.style.margin='6px 0';
@@ -214,10 +239,161 @@ async function loadVoice(){
     list.appendChild(row);
   });
 }
+
+/* ---- Voice / mic (browser capture → WebSocket → Live / fallback) ---- */
+let voiceWS = null, mediaStream = null, audioCtx = null, processor = null, sourceNode = null;
+let talking = false, voiceMode = false, holdTalk = false;
+const playQueue = [];
+let playing = false, playCtx = null, playTime = 0;
+
+function setVoiceStatus(t){ const el=$('#voice-status'); if(el) el.textContent = t || ''; }
+function setVoiceModeLabel(){
+  $('#voice-mode-label').textContent = voiceMode ? 'On' : 'Off';
+  $('#voice-mode-toggle').checked = voiceMode;
+}
+async function setVoiceMode(on){
+  voiceMode = !!on; setVoiceModeLabel();
+  if (voiceMode) { await startTalk({continuous:true}); }
+  else { stopTalk(); }
+  fetch('/api/voice/mode', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({on: voiceMode})}).catch(()=>{});
+}
+async function ensureWS(){
+  if (voiceWS && voiceWS.readyState === 1) return voiceWS;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  voiceWS = new WebSocket(proto + '://' + location.host + '/ws/voice');
+  voiceWS.binaryType = 'arraybuffer';
+  await new Promise((res, rej) => {
+    voiceWS.onopen = res; voiceWS.onerror = rej;
+    setTimeout(() => rej(new Error('ws timeout')), 8000);
+  });
+  voiceWS.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      try {
+        const j = JSON.parse(ev.data);
+        if (j.type === 'status') {
+          setVoiceStatus(j.state + (j.engine ? ' · ' + j.engine : '') + (j.model ? ' · ' + j.model : ''));
+          const pill = $('#voice-engine-pill');
+          if (j.engine) { pill.style.display='inline-block'; pill.textContent = j.engine; }
+          if (j.state === 'idle' && !voiceMode) stopTalkUi();
+        } else if (j.type === 'transcript') {
+          append(j.role === 'user' ? 'user' : 'assistant', j.text);
+        } else if (j.type === 'error') {
+          setVoiceStatus(j.detail || 'Voice error');
+        }
+      } catch(e){}
+      return;
+    }
+    enqueuePlay(new Int16Array(ev.data));
+  };
+  voiceWS.onclose = () => { if (voiceMode || talking) setVoiceStatus('Voice connection closed'); };
+  return voiceWS;
+}
+function enqueuePlay(i16){
+  playQueue.push(i16);
+  if (!playing) drainPlay();
+}
+async function drainPlay(){
+  playing = true;
+  try {
+    if (!playCtx) playCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate:24000});
+    if (playCtx.state === 'suspended') await playCtx.resume();
+    while (playQueue.length) {
+      const i16 = playQueue.shift();
+      const f32 = new Float32Array(i16.length);
+      for (let i=0;i<i16.length;i++) f32[i] = i16[i] / 32768;
+      const buf = playCtx.createBuffer(1, f32.length, 24000);
+      buf.copyToChannel(f32, 0);
+      const src = playCtx.createBufferSource();
+      src.buffer = buf; src.connect(playCtx.destination);
+      const startAt = Math.max(playCtx.currentTime + 0.02, playTime);
+      src.start(startAt);
+      playTime = startAt + buf.duration;
+      await new Promise(r => { src.onended = r; setTimeout(r, buf.duration*1000 + 50); });
+    }
+  } catch(e) { console.warn('play', e); }
+  playing = false;
+}
+async function startMic(){
+  if (mediaStream) return;
+  mediaStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation:true, noiseSuppression:true, channelCount:1 }, video:false });
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({sampleRate:16000});
+  sourceNode = audioCtx.createMediaStreamSource(mediaStream);
+  processor = audioCtx.createScriptProcessor(4096, 1, 1);
+  processor.onaudioprocess = (e) => {
+    if (!talking && !voiceMode) return;
+    if (!voiceWS || voiceWS.readyState !== 1) return;
+    const input = e.inputBuffer.getChannelData(0);
+    const i16 = new Int16Array(input.length);
+    for (let i=0;i<input.length;i++) {
+      const s = Math.max(-1, Math.min(1, input[i]));
+      i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    voiceWS.send(i16.buffer);
+  };
+  sourceNode.connect(processor);
+  processor.connect(audioCtx.destination);
+}
+function stopMic(){
+  try { processor && processor.disconnect(); sourceNode && sourceNode.disconnect(); } catch(e){}
+  processor = sourceNode = null;
+  if (audioCtx) { try { audioCtx.close(); } catch(e){} audioCtx = null; }
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+}
+async function startTalk(opts){
+  opts = opts || {};
+  try {
+    $('#mic-btn').classList.add('busy');
+    await ensureWS();
+    await startMic();
+    voiceWS.send(JSON.stringify({type:'start', continuous: !!opts.continuous || voiceMode}));
+    talking = true;
+    $('#mic-btn').classList.add('listening');
+    $('#mic-btn').classList.remove('busy');
+    setVoiceStatus(voiceMode ? 'Voice mode on — listening' : 'Listening… click mic to stop');
+  } catch (e) {
+    $('#mic-btn').classList.remove('busy','listening');
+    setVoiceStatus('Mic error: ' + (e.message || e) + ' — allow microphone for this page.');
+    talking = false;
+  }
+}
+function stopTalk(){
+  talking = false; holdTalk = false;
+  if (voiceWS && voiceWS.readyState === 1) {
+    try { voiceWS.send(JSON.stringify({type:'stop'})); } catch(e){}
+  }
+  stopTalkUi();
+  if (!voiceMode) stopMic();
+}
+function stopTalkUi(){
+  $('#mic-btn').classList.remove('listening','busy');
+  if (!voiceMode) setVoiceStatus('');
+}
+const mic = $('#mic-btn');
+mic.addEventListener('click', () => {
+  if (voiceMode) return; // continuous mode uses the toggle
+  if (talking) stopTalk(); else startTalk({continuous:false});
+});
+mic.addEventListener('mousedown', (e) => { if (voiceMode) return; holdTalk = true; if (!talking) startTalk({continuous:false}); });
+mic.addEventListener('mouseup', () => { if (holdTalk) { holdTalk = false; stopTalk(); } });
+mic.addEventListener('mouseleave', () => { if (holdTalk) { holdTalk = false; stopTalk(); } });
+mic.addEventListener('touchstart', (e) => { e.preventDefault(); if (!voiceMode && !talking) { holdTalk = true; startTalk({continuous:false}); } }, {passive:false});
+mic.addEventListener('touchend', () => { if (holdTalk) { holdTalk = false; stopTalk(); } });
+
+async function testSpeak(){
+  setVoiceStatus('Testing voice…');
+  try {
+    const r = await fetch('/api/voice/test', {method:'POST'});
+    const j = await r.json();
+    setVoiceStatus(j.ok ? 'Test OK — ' + (j.engine || '') : (j.error || 'Test failed'));
+    if (j.path) { try { new Audio('/api/file?path='+encodeURIComponent(j.path)).play(); } catch(e){} }
+  } catch(e) { setVoiceStatus('Test failed'); }
+}
 async function saveVoice(){
   const voice = (document.querySelector('input[name=voice]:checked')||{}).value;
+  const enabled = $('#voice-enabled').checked;
+  $('#voice-enabled-label').textContent = enabled ? 'On' : 'Off';
   await fetch('/api/voice', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
-    mode: $('#voice-mode').value, voice_id: voice, enabled: $('#voice-enabled').checked
+    mode: $('#voice-mode').value, voice_id: voice, enabled
   })});
 }
 async function previewVoice(id){
@@ -252,6 +428,7 @@ async function saveKey(){
 }
 async function halt(){ await fetch('/api/halt', {method:'POST'}); alert('Agent halted. Resume from tray or restart.'); }
 loadSettings();
+try { const vp = new URLSearchParams(location.search).get('voice'); if (vp === '1') setVoiceMode(true); } catch(e){}
 fetch('/api/status').then(r=>r.json()).then(j=>{ if(j.model_note) $('#model-note').textContent=j.model_note; }).catch(()=>{});
 </script>
 </body>
@@ -288,6 +465,7 @@ def create_app(
     resume_fn: Callable[[], None] | None = None,
     status_fn: Callable[[], str] | None = None,
     stream_fn: Callable[[str], Any] | None = None,
+    voice_hub: Any | None = None,
 ) -> FastAPI:
     app = FastAPI(title="PC Agent")
 
@@ -318,6 +496,30 @@ def create_app(
             yield "data: " + _json.dumps({"done": True, "model_note": status_fn() if status_fn else ""}) + "\n\n"
         return StreamingResponse(gen(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+    @app.websocket("/ws/voice")
+    async def ws_voice(ws):
+        await ws.accept()
+        if voice_hub is None:
+            await ws.send_json({"type": "error", "detail": "Voice not ready — add your Gemini API key in Settings."})
+            await ws.close()
+            return
+        await voice_hub.handle(ws)
+
+    @app.post("/api/voice/mode")
+    def api_voice_mode(body: dict) -> dict:
+        if voice_hub is None:
+            return {"ok": False, "error": "voice not ready"}
+        on = bool(body.get("on"))
+        voice_hub.set_mode(on)
+        return {"ok": True, "on": on}
+
+    @app.post("/api/voice/test")
+    def api_voice_test() -> dict:
+        if voice is None:
+            return {"ok": False, "error": "voice engine unavailable"}
+        return voice.preview()
 
     @app.get("/api/status")
     def api_status() -> dict:
