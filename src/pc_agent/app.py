@@ -245,22 +245,36 @@ class Agent:
                     logger.exception("speak failed")
 
         def jobs_loop() -> None:
+            turns = {"n": 0}
             while True:
                 job = self._jobs.get()
                 try:
                     if job[0] == "post_turn":
                         _, user_text, reply = job
                         t = time.time()
+                        turns["n"] += 1
+                        # Cheap heuristics only — no Gemini call
                         self.memory.auto_extract(user_text, reply)
-                        if self.brain:
-                            self.memory.embed_pending()
-                            if self.memory.needs_summarization():
-                                older = self.memory.messages_to_summarize()
-                                if older:
-                                    summary = self.brain.summarize(older)
-                                    if summary:
-                                        self.memory.add_summary(summary, older[-1]["id"])
-                                        self.memory.drop_messages_up_to(older[-1]["id"])
+                        # Embeddings / summaries burn free-tier quota; do them rarely
+                        # and only when no text models are cooling from 429s.
+                        if self.brain and turns["n"] % 15 == 0:
+                            cooling = any(
+                                not self.brain.health.usable(m)
+                                for m in (self.brain.router.candidates or [])[:5]
+                            )
+                            if not cooling:
+                                try:
+                                    self.memory.embed_pending(limit=5)
+                                except Exception:
+                                    pass
+                                if self.memory.needs_summarization():
+                                    older = self.memory.messages_to_summarize()
+                                    if older:
+                                        # Local extractive summary — no API
+                                        summary = _local_summary(older)
+                                        if summary:
+                                            self.memory.add_summary(summary, older[-1]["id"])
+                                            self.memory.drop_messages_up_to(older[-1]["id"])
                         timing.info("post_turn_bg %.2fs", time.time() - t)
                 except Exception:
                     logger.exception("background job failed")
@@ -344,6 +358,7 @@ class Agent:
             self.tg.start()
 
     def run(self, open_browser: bool = True) -> None:
+        _acquire_app_mutex()
         self.bootstrap()
         app = create_app(
             chat_fn=self.chat,
@@ -416,6 +431,18 @@ class Agent:
         sys.exit(0)
 
 
+def _local_summary(messages: list[dict], max_chars: int = 800) -> str:
+    """Extractive summary without calling Gemini (saves free-tier quota)."""
+    lines = []
+    for m in messages[-40:]:
+        role = m.get("role", "")
+        content = (m.get("content") or "").strip().replace("\n", " ")
+        if content:
+            lines.append(f"{role}: {content[:160]}")
+    blob = " | ".join(lines)
+    return (blob[:max_chars] + "…") if len(blob) > max_chars else blob
+
+
 class SentenceSplitter:
     """Accumulate streamed text; emit complete sentences for low-latency TTS."""
 
@@ -477,6 +504,27 @@ def _shorten_for_speech(text: str, max_chars: int = 400) -> str:
                 break
     spoken = " ".join(parts) if parts else joined
     return spoken[:max_chars]
+
+
+def _acquire_app_mutex() -> None:
+    """Single-instance mutex for Inno AppMutex / upgrades (Windows)."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        # Must match installer AppMutex
+        name = "PCAgentSingletonMutex_A7C3E9D1"
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
+        if not handle:
+            return
+        # Keep handle alive for process lifetime
+        global _APP_MUTEX_HANDLE
+        _APP_MUTEX_HANDLE = handle
+    except Exception:
+        logger.debug("CreateMutex failed", exc_info=True)
+
+
+_APP_MUTEX_HANDLE = None
 
 
 def main(argv: list[str] | None = None) -> None:

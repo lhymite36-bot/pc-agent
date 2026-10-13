@@ -37,8 +37,11 @@ def selftest() -> int:
         from pc_agent.core.voice import VoiceEngine  # noqa: F401
         from pc_agent.core.live_session import LiveVoiceSession  # noqa: F401
         from pc_agent.core.terminal_audio import list_devices, sounddevice_available
+        from pc_agent.core import local_stt
 
         print("  imports=ok")
+        ok_stt, stt_detail = local_stt.available()
+        print(f"  faster_whisper={'ok' if ok_stt else stt_detail}")
     except Exception as exc:
         errors.append(f"imports: {exc}")
         print(f"  FAIL imports: {exc}")
@@ -314,7 +317,6 @@ class TerminalApp:
         if len(pcm) < 3200:
             self.status("Didn't catch that.")
             return
-        self.status("Transcribing…")
         text = self._stt(pcm)
         if not text:
             self.status("Couldn't transcribe.")
@@ -351,42 +353,82 @@ class TerminalApp:
         eng._play_pcm_chunk = _play  # type: ignore[method-assign]
 
     def _stt(self, pcm: bytes) -> str:
-        key = __import__("pc_agent.config", fromlist=["get_api_key"]).get_api_key()
-        if not key:
-            return ""
+        """Local offline STT first (no quota). Cloud STT only as last resort with failover."""
+        # 1) Offline faster-whisper
         try:
-            from google import genai
-            from google.genai import types
-            from pc_agent.config import FALLBACK_MODELS, load_config
-            import io
-            import wave
+            from pc_agent.core.local_stt import available, transcribe
 
-            client = genai.Client(api_key=key)
-            model = load_config().get("model") or FALLBACK_MODELS[0]
-            bio = io.BytesIO()
-            with wave.open(bio, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)
-                wf.setframerate(16000)
-                wf.writeframes(pcm)
-            resp = client.models.generate_content(
-                model=model,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(
-                                text="Transcribe this speech exactly. Reply with only the transcript."
-                            ),
-                            types.Part.from_bytes(data=bio.getvalue(), mime_type="audio/wav"),
-                        ],
-                    )
+            ok, detail = available()
+            if ok:
+                self.status("Transcribing offline…")
+                text = transcribe(pcm, on_progress=self.status)
+                if text:
+                    return text
+            else:
+                logger.info("local STT unavailable: %s", detail)
+        except Exception as exc:
+            logger.warning("local STT failed: %s", exc)
+            self.status(f"Offline STT issue: {exc}")
+
+        # 2) Cloud STT with shared model failover (only if local failed)
+        return self._stt_cloud(pcm)
+
+    def _stt_cloud(self, pcm: bytes) -> str:
+        from pc_agent.config import FALLBACK_MODELS, get_api_key, load_config
+        from pc_agent.core.models import AllModelsFailed, ModelRouter, is_retryable
+        from pc_agent.core.quota import format_quota_notice, is_quota_exhausted
+
+        key = get_api_key()
+        if not key or not self.agent.brain:
+            return ""
+        import io, wave
+        from google.genai import types
+
+        bio = io.BytesIO()
+        with wave.open(bio, "wb") as wf:
+            wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
+            wf.writeframes(pcm)
+        wav = bio.getvalue()
+        brain = self.agent.brain
+        contents = [
+            types.Content(
+                role="user",
+                parts=[
+                    types.Part.from_text(text="Transcribe this speech exactly. Reply with only the transcript."),
+                    types.Part.from_bytes(data=wav, mime_type="audio/wav"),
                 ],
             )
+        ]
+
+        def _call(model):
+            return brain.client.models.generate_content(model=model, contents=contents)
+
+        try:
+            # Reuse text router so 429s cool models with retryDelay
+            resp = brain.router.call(_call)
             return (resp.text or "").strip()
-        except Exception as exc:
-            logger.warning("STT failed: %s", exc)
+        except AllModelsFailed as exc:
+            if is_quota_exhausted(exc):
+                notice = format_quota_notice(exc)
+                self.print(notice)
+                self._force_offline_voice()
+            else:
+                self.status("Cloud STT unavailable on every model.")
             return ""
+        except Exception as exc:
+            logger.warning("cloud STT failed: %s", exc)
+            if is_quota_exhausted(exc):
+                self.print(format_quota_notice(exc))
+                self._force_offline_voice()
+            return ""
+
+    def _force_offline_voice(self) -> None:
+        from pc_agent.config import load_config, save_config
+        cfg = load_config()
+        if cfg.get("voice_mode") != "offline":
+            cfg["voice_mode"] = "offline"
+            save_config(cfg)
+            self.status("Switched voice to offline SAPI until quota resets.")
 
     # --- hands-free Live ---
 

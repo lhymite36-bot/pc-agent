@@ -33,6 +33,13 @@ Dangerous actions (delete, install, send message/email, payments, registry, shut
 ### Automatic model failover
 A ranked list of good text models is built from `models.list` (cached ~3 h): newest flash first, then pro, then other flash — no lite/TTS/embedding/image/Veo/Live. On 503/429/404/500 it retries once, then silently moves to the next model, sticks with the working one for 15 min, then tries the preferred model again. A 404 on the configured model saves the replacement to config. The UI shows a tiny “Using <model>” note; if everything fails you get a friendly message, never a raw error. Vision, planner, screen awareness, summaries and embeddings share the same failover; TTS and Live voice walk their own expressive model lists, then SAPI.
 
+### Offline STT + quota (1.0.7)
+- **Local STT by default** (faster-whisper `base` int8 on CPU; model downloads once into the data dir). No free-tier quota spent on transcription.
+- 429s fail over across flash models with `retryDelay` cooldowns (persisted). Live / TTS / chat share the same health store.
+- Clear one-line notice when free quota is gone (local reset time + billing hint); replies fall back to Windows SAPI.
+- Memory extraction stays heuristic; embeddings/summaries are batched rarely and never call Gemini for summaries.
+- Installer upgrades while the app is running: AppMutex, CloseApplications, and `taskkill` of PCAgent/AtlasCLI before copy.
+
 ### Terminal mode (1.0.6)
 - **Atlas (Terminal)** Start Menu shortcut → `AtlasCLI.exe` (console), or `PCAgent.exe --cli`.
 - Streaming text chat in the terminal (rich). Same brain, tools, memory, failover, safety.

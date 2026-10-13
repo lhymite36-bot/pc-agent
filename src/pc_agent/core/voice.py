@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Iterator
 
 from pc_agent.core.models import is_retryable
+from pc_agent.core.quota import format_quota_notice, is_quota_exhausted
 from pc_agent.config import (
     DEFAULT_VOICE,
     LIVE_MODEL,
@@ -109,7 +110,18 @@ class VoiceEngine:
             result = self._speak_tts(styled, on_chunk=on_chunk)
             if result.get("ok"):
                 return result
-            logger.info("TTS failed (%s); trying offline", result.get("error"))
+            err = result.get("error") or ""
+            logger.info("TTS failed (%s); trying offline", err)
+            if is_quota_exhausted(err):
+                try:
+                    cfg = load_config()
+                    cfg["voice_mode"] = "offline"
+                    save_config(cfg)
+                except Exception:
+                    pass
+                result = self._speak_offline(text)
+                result["quota_notice"] = format_quota_notice(err)
+                return result
 
         return self._speak_offline(text)
 

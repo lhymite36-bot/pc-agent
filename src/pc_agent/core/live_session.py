@@ -268,32 +268,45 @@ class LiveVoiceSession:
 
     def _stt(self, pcm: bytes) -> str:
         try:
+            from pc_agent.core.local_stt import available, transcribe
+            ok, _ = available()
+            if ok:
+                text = transcribe(pcm)
+                if text:
+                    return text
+        except Exception as exc:
+            logger.warning("local STT failed: %s", exc)
+        try:
             from google import genai
             from google.genai import types
-            from pc_agent.config import FALLBACK_MODELS, load_config
+            from pc_agent.config import FALLBACK_MODELS, data_dir, load_config
+            from pc_agent.core.models import ModelCatalog, ModelHealth, ModelRouter
+            from pc_agent.core.quota import format_quota_notice, is_quota_exhausted
+            import io, wave
 
             client = genai.Client(api_key=self.api_key)
-            model = load_config().get("model") or FALLBACK_MODELS[0]
-            # WAV-wrap for mime clarity
-            import io, wave
+            health = ModelHealth(data_dir() / "model_health.json")
+            cat = ModelCatalog(client, cache_path=data_dir() / "models_cache.json")
+            ranked = cat.text_models(FALLBACK_MODELS, latency=health.latency_map())
+            router = ModelRouter("stt", ranked or list(FALLBACK_MODELS),
+                                 preferred=load_config().get("model"), health=health)
             bio = io.BytesIO()
             with wave.open(bio, "wb") as wf:
                 wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(16000)
                 wf.writeframes(pcm)
             wav = bio.getvalue()
-            resp = client.models.generate_content(
-                model=model,
-                contents=[
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part.from_text(text="Transcribe this speech exactly. Reply with only the transcript, nothing else."),
-                            types.Part.from_bytes(data=wav, mime_type="audio/wav"),
-                        ],
-                    )
-                ],
-            )
+            contents = [types.Content(role="user", parts=[
+                types.Part.from_text(text="Transcribe this speech exactly. Reply with only the transcript."),
+                types.Part.from_bytes(data=wav, mime_type="audio/wav"),
+            ])]
+            resp = router.call(lambda m: client.models.generate_content(model=m, contents=contents))
             return (resp.text or "").strip()
         except Exception as exc:
             logger.warning("STT failed: %s", exc)
+            try:
+                from pc_agent.core.quota import format_quota_notice, is_quota_exhausted
+                if is_quota_exhausted(exc):
+                    self._emit({"type": "status", "state": "quota", "detail": format_quota_notice(exc)})
+            except Exception:
+                pass
             return ""

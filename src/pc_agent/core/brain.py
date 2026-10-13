@@ -411,10 +411,22 @@ class Brain:
                             text_parts.append(p.text)
                             model_parts.append(p)
                             yield p.text
-            except AllModelsFailed:
+            except AllModelsFailed as exc:
                 if self._history and self._history[-1] is user_msg:
                     self._history.pop()
-                yield ALL_FAILED_MSG
+                try:
+                    from pc_agent.core.quota import format_quota_notice, is_quota_exhausted
+                    if is_quota_exhausted(exc):
+                        from pc_agent.config import load_config, save_config
+                        cfg = load_config()
+                        if cfg.get("voice_mode") != "offline":
+                            cfg["voice_mode"] = "offline"
+                            save_config(cfg)
+                        yield format_quota_notice(exc)
+                    else:
+                        yield ALL_FAILED_MSG
+                except Exception:
+                    yield ALL_FAILED_MSG
                 return
             except Exception:
                 logger.exception("generate failed")

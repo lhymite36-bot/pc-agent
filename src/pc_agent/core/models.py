@@ -125,6 +125,14 @@ def is_retryable(exc: BaseException) -> bool:
 
 
 def retry_delay_sec(exc: BaseException) -> float:
+    """Parse retryDelay / 'retry in 7h26m' from a 429 error."""
+    try:
+        from pc_agent.core.quota import parse_retry_seconds
+        secs = parse_retry_seconds(exc)
+        if secs is not None:
+            return float(secs)
+    except Exception:
+        pass
     s = str(exc)
     m = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s", s) or re.search(
         r"retry in (\d+(?:\.\d+)?)\s*s", s, re.I

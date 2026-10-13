@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 python -m pip install -U pip
 pip install -e ".[windows,voice]"
-pip install pyinstaller pyttsx3 pywin32 sounddevice rich numpy
+pip install pyinstaller pyttsx3 pywin32 sounddevice rich numpy faster-whisper
 
 $common = @(
   "--noconfirm", "--clean",
@@ -28,6 +28,8 @@ $common = @(
   "--hidden-import=pc_agent.ui.voice_hub",
   "--hidden-import=pc_agent.core.hotkeys",
   "--hidden-import=sounddevice",
+  "--hidden-import=faster_whisper",
+  "--collect-all", "faster_whisper",
   "--hidden-import=_sounddevice_data",
   "--collect-submodules", "pc_agent",
   "--collect-binaries", "sounddevice"
