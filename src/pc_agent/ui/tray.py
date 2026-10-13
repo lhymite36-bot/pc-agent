@@ -1,0 +1,56 @@
+"""System tray icon + menu."""
+
+from __future__ import annotations
+
+import logging
+import threading
+import webbrowser
+from typing import Callable
+
+logger = logging.getLogger("pc_agent.tray")
+
+
+def start_tray(
+    open_ui: Callable[[], None],
+    halt: Callable[[], None],
+    resume: Callable[[], None],
+    quit_app: Callable[[], None],
+) -> threading.Thread | None:
+    try:
+        import pystray
+        from PIL import Image, ImageDraw
+    except Exception as exc:
+        logger.warning("tray unavailable: %s", exc)
+        return None
+
+    def _icon_image():
+        img = Image.new("RGB", (64, 64), "#1a1f29")
+        d = ImageDraw.Draw(img)
+        d.ellipse((8, 8, 56, 56), fill="#6aa7ff")
+        d.rectangle((28, 20, 36, 44), fill="#0f1115")
+        return img
+
+    def on_open(icon, item):  # noqa: ARG001
+        open_ui()
+
+    def on_halt(icon, item):  # noqa: ARG001
+        halt()
+
+    def on_resume(icon, item):  # noqa: ARG001
+        resume()
+
+    def on_quit(icon, item):  # noqa: ARG001
+        quit_app()
+        icon.stop()
+
+    menu = pystray.Menu(
+        pystray.MenuItem("Open chat", on_open, default=True),
+        pystray.MenuItem("Halt (kill switch)", on_halt),
+        pystray.MenuItem("Resume", on_resume),
+        pystray.MenuItem("Quit", on_quit),
+    )
+    icon = pystray.Icon("pc-agent", _icon_image(), "PC Agent", menu)
+
+    t = threading.Thread(target=icon.run, name="pc-agent-tray", daemon=True)
+    t.start()
+    return t

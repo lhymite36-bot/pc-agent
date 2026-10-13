@@ -1,0 +1,110 @@
+# PC Agent
+
+Always-on Windows desktop agent with a Gemini brain. Controls your whole PC — shell, files, apps, mouse/keyboard, windows, clipboard, screenshots + vision, browser automation, scheduling — and talks back with a **human** voice.
+
+Built to be better than a chatbox: long-term memory, proactive notices, multi-step planning with screenshot self-check, reusable skills, and plugins.
+
+## Download
+
+After CI publishes a release:
+
+- **Installer:** `https://github.com/lhymite36-bot/pc-agent/releases/latest/download/PCAgent-Setup.exe`
+- **Repo:** https://github.com/lhymite36-bot/pc-agent
+
+## Setup (Windows)
+
+1. Download and run `PCAgent-Setup.exe` (or run from source — below).
+2. On first launch the chat UI opens at http://127.0.0.1:8765/
+3. Open **Settings** → paste your **Gemini API key** → Save. It is stored in **Windows Credential Manager** (via `keyring`).
+4. Pick a voice under **Voice** (default: **Sulafat — Warm**, Live native-audio).
+5. Leave it running in the tray. Enable **Start at login** for 24/7.
+
+### Kill switch
+
+**Ctrl+Alt+Esc** immediately halts all actions. Resume from the tray menu or the UI.
+
+Dangerous actions (delete, install, send message/email, payments, registry, shutdown, Chrome profile) show a confirmation before running.
+
+## Features
+
+### Brain
+- Gemini function calling; model is configurable and discovered at runtime (default `gemini-2.5-flash`).
+
+### Voice (realistic / human)
+| Priority | Engine | Notes |
+|---|---|---|
+| 1 (default) | **Gemini Live** `gemini-3.8-live` | Native audio — natural prosody, emotion, breaths, barge-in. Streams PCM for low latency. |
+| 2 | **Gemini TTS** `gemini-3.8-flash-tts` | Expressive non-live path with a conversational style prompt. Not the flat lite models. |
+| 3 | **Offline SAPI / pyttsx3** | Robotic last-resort fallback — labeled as such in Settings. |
+
+Warm default voice: **Sulafat**. Voice picker with previews. Style: *conversational, casual, contractions* — not reading a script.
+
+### Memory (first-class)
+- SQLite long-term store with **remember / recall / forget** tools the model calls itself.
+- Automatic extraction of durable facts & preferences from chat.
+- Recall into every prompt (FTS5 keyword search + Gemini embeddings when available).
+- Conversation history across restarts with rolling summarization.
+- Task / episode log.
+- **Memory** view in the UI: list, search, delete.
+
+### Proactive mode
+Notices low disk, stuck downloads, due reminders — speaks up / logs an episode. Toggle in Settings.
+
+### Screen awareness (privacy)
+Optional periodic screen understanding so “what's this error?” is instant. **Off by default.**
+
+### Planner
+`run_plan` — plan → execute tools → verify with screenshot → retry once.
+
+### Browser
+Playwright tools. Using your Chrome profile requires an explicit confirmation.
+
+### Skills & plugins
+- Save repeated workflows as named JSON skills (`save_skill` / `run_skill`).
+- Drop custom Python tools into `%LOCALAPPDATA%\pc-agent\plugins\` (`DECLARATIONS` + `HANDLERS`).
+
+### Personality
+Name + tone in Settings. Default agent name **Atlas**, witty/warm.
+
+### Telegram (optional)
+Bot token + allowlisted chat id. Ignores everyone else.
+
+## Run from source
+
+```bash
+pip install -e ".[dev]"
+python -m pc_agent
+```
+
+24/7 supervisor (restart on crash):
+
+```bash
+python -m pc_agent --watchdog
+```
+
+## Tests
+
+```bash
+pytest -q
+```
+
+GUI / OS automation is mocked or skipped on Linux CI. Windows build is produced by GitHub Actions (`windows-latest`) with PyInstaller + Inno Setup.
+
+## Safety
+
+- Confirmation gate for destructive / external actions.
+- Global kill-switch hotkey.
+- Append-only action log: `%LOCALAPPDATA%\pc-agent\actions.log`
+- Screen awareness and Chrome-profile browser use are opt-in.
+
+## Limitations
+
+- Full desktop control (mouse/keyboard/windows) requires a real Windows session (not a headless RDP lock screen).
+- Gemini Live / TTS need network + quota on your API key.
+- Playwright is optional; install with `pip install playwright && playwright install chromium` for browser tools.
+- Offline voice is intentionally robotic.
+- Confirmation prompts in fully headless mode deny by default (safe).
+
+## License
+
+MIT — for Pedro's personal use.
