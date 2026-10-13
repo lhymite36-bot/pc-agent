@@ -99,3 +99,13 @@ def test_build_memory_context(store: MemoryStore):
     store.remember("User's name is Pedro", kind="fact")
     ctx = store.build_memory_context("What is my name?")
     assert "Pedro" in ctx
+
+
+def test_remember_is_fast_and_embeds_in_background(store):
+    calls = []
+    store.set_embedder(lambda t: calls.append(t) or [1.0, 0.0])
+    store.remember("Likes tea", kind="preference")
+    assert calls == []  # no network on the request path
+    assert store.embed_pending() == 1 and calls == ["Likes tea"]
+    ctx = store.build_memory_context("tea")
+    assert "tea" in ctx and len(calls) == 1  # prompt recall is FTS-only

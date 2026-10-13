@@ -155,9 +155,9 @@ class VoiceEngine:
         last_err = None
         pcm_chunks: list[bytes] = []
 
-        for model in [m for m in models for _ in (0, 1)]:
-            if last_err is not None:
-                self._retry_pause(last_err)
+        for model in models:
+            if not self._health().usable(model):
+                continue
             try:
                 config = {
                     "response_modalities": ["AUDIO"],
@@ -229,6 +229,7 @@ class VoiceEngine:
                 last_err = "no audio returned"
             except Exception as exc:
                 last_err = str(exc)
+                self._mark_failure(model, exc)
                 logger.debug("live model %s failed: %s", model, exc)
                 continue
         return {"ok": False, "error": last_err or "live failed", "path": "live"}
@@ -247,9 +248,9 @@ class VoiceEngine:
         models = self._ranked("tts", TTS_MODEL_FALLBACKS)
         last_err = None
 
-        for model in [m for m in models for _ in (0, 1)]:
-            if last_err is not None:
-                self._retry_pause(last_err)
+        for model in models:
+            if not self._health().usable(model):
+                continue
             # Skip known-flat lite models explicitly
             if "lite" in model or "3.1-flash-tts" in model:
                 continue
@@ -328,6 +329,7 @@ class VoiceEngine:
                 }
             except Exception as exc:
                 last_err = str(exc)
+                self._mark_failure(model, exc)
                 logger.debug("TTS model %s failed: %s", model, exc)
         return {"ok": False, "error": last_err or "tts failed", "path": "tts"}
 
@@ -363,7 +365,7 @@ class VoiceEngine:
             if self._client is not None:
                 if not hasattr(self, "_catalog"):
                     from pc_agent.core.models import ModelCatalog
-                    self._catalog = ModelCatalog(self._client)
+                    self._catalog = ModelCatalog(self._client, cache_path=data_dir() / "models_cache.json")
                 names = self._catalog.names()
         except Exception:
             names = []
@@ -379,10 +381,21 @@ class VoiceEngine:
         merged = list(dict.fromkeys(list(fallback) + out))
         return merged
 
-    def _retry_pause(self, err) -> bool:
-        import time as _t
-        _t.sleep(0.5)
-        return True
+    def _health(self):
+        if not hasattr(self, "_health_obj"):
+            from pc_agent.core.models import ModelHealth
+            self._health_obj = ModelHealth(data_dir() / "model_health.json")
+        return self._health_obj
+
+    def _mark_failure(self, model: str, exc: Exception) -> None:
+        from pc_agent.core.models import _code, retry_delay_sec
+        code = _code(exc)
+        if code == 404:
+            self._health().mark_dead(model)
+        elif code == 429:
+            self._health().mark_cooling(model, retry_delay_sec(exc))
+        elif code in (500, 503):
+            self._health().mark_cooling(model, 30)
 
     # --- audio helpers ---
 
@@ -398,10 +411,14 @@ class VoiceEngine:
         with self._play_lock:
             try:
                 import sounddevice as sd
-                import numpy as np
 
-                audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-                sd.play(audio, rate, blocking=False)
+                stream = getattr(self, "_out_stream", None)
+                if stream is None or getattr(self, "_out_rate", None) != rate:
+                    stream = sd.RawOutputStream(samplerate=rate, channels=1, dtype="int16", latency="low")
+                    stream.start()
+                    self._out_stream, self._out_rate = stream, rate
+                # Continuous stream: chunks and sentences play back-to-back, no cut-offs
+                stream.write(pcm)
                 return
             except Exception:
                 pass
@@ -412,7 +429,7 @@ class VoiceEngine:
                 if __import__("sys").platform == "win32":
                     import winsound
 
-                    winsound.PlaySound(str(path), winsound.SND_FILENAME | winsound.SND_ASYNC)
+                    winsound.PlaySound(str(path), winsound.SND_FILENAME)
                 else:
                     # Linux test env: skip audible play
                     pass

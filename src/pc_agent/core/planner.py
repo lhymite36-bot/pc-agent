@@ -51,7 +51,7 @@ class Planner:
         try:
             from google.genai import types
 
-            response = self.brain.generate(prompt, types.GenerateContentConfig(temperature=0.2))
+            response = self.brain.generate(prompt, types.GenerateContentConfig(temperature=0.2), thinking="high")
             text = (response.text or "").strip()
             text = _extract_json(text)
             data = json.loads(text)

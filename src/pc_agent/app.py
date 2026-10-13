@@ -34,11 +34,24 @@ from pc_agent.ui.telegram_bot import TelegramBridge
 from pc_agent.ui.tray import start_tray
 from pc_agent.ui.web_ui import create_app, run_server
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
+def _setup_logging() -> None:
+    from logging.handlers import RotatingFileHandler
+    from pc_agent.config import data_dir
+
+    handlers: list[logging.Handler] = [
+        RotatingFileHandler(data_dir() / "agent.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+    ]
+    if sys.stderr is not None:  # windowed exe has no console
+        handlers.append(logging.StreamHandler())
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        handlers=handlers)
+    for noisy in ("httpx", "httpcore", "google_genai.models", "uvicorn.access"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
+_setup_logging()
 logger = logging.getLogger("pc_agent")
+timing = logging.getLogger("pc_agent.timing")
 
 
 class Agent:
@@ -55,6 +68,7 @@ class Agent:
         self._confirm_events: dict[str, threading.Event] = {}
         self._confirm_results: dict[str, bool] = {}
         self._lock = threading.RLock()
+        self._start_workers()
 
     def bootstrap(self) -> None:
         if not self.api_key:
@@ -153,56 +167,98 @@ class Agent:
         return False
 
     def chat(self, text: str) -> str:
+        return "".join(self.chat_stream(text))
+
+    def chat_stream(self, text: str):
+        """Yield reply deltas; speak sentence by sentence; memory work after the reply."""
+        t0 = time.time()
         with self._lock:
             if safety.is_halted():
-                return "I'm halted (kill-switch). Resume from the tray or /api/resume."
+                yield "I'm halted (kill-switch). Resume from the tray or /api/resume."
+                return
             if not self.brain:
                 key = get_api_key()
                 if not key:
-                    return "Add your Gemini API key in Settings first."
+                    yield "Add your Gemini API key in Settings first."
+                    return
                 self.api_key = key
                 self.voice = VoiceEngine(key)
                 self._init_brain()
                 self.bootstrap_tools_only()
 
-            # Persist user turn
             self.memory.add_message("user", text)
 
-            # Maybe summarize old history
-            if self.memory.needs_summarization() and self.brain:
-                older = self.memory.messages_to_summarize()
-                if older:
-                    summary = self.brain.summarize(older)
-                    if summary:
-                        self.memory.add_summary(summary, older[-1]["id"])
-                        self.memory.drop_messages_up_to(older[-1]["id"])
-
-            # Attach last screenshot if user asks about on-screen content
             image = None
             lower = text.lower()
-            if any(
-                k in lower
-                for k in ("on screen", "what's this", "whats this", "this error", "see this")
-            ):
-                if self.screen and self.screen.last_summary:
-                    pass  # already in system prompt
-                else:
+            if any(k in lower for k in ("on screen", "what's this", "whats this", "this error", "see this")):
+                if not (self.screen and self.screen.last_summary):
                     take_screenshot({})
                     image = load_last_screenshot_bytes()
 
+            speak = load_config().get("voice_enabled", True)
+            splitter = SentenceSplitter()
+            reply_parts: list[str] = []
+            first = True
             assert self.brain is not None
-            reply = self.brain.chat(text, image_bytes=image)
+            for delta in self.brain.chat_stream(text, image_bytes=image):
+                if first:
+                    timing.info("first_token %.2fs", time.time() - t0)
+                    first = False
+                reply_parts.append(delta)
+                yield delta
+                if speak:
+                    for sentence in splitter.feed(delta):
+                        self._speech.put(sentence)
+            if speak:
+                tail = splitter.flush()
+                if tail:
+                    self._speech.put(tail)
+            reply = "".join(reply_parts)
             self.memory.add_message("assistant", reply)
-            self.memory.auto_extract(text, reply)
+            timing.info("reply_total %.2fs", time.time() - t0)
+        # Background: extraction, embeddings, summarization — never block the reply
+        self._jobs.put(("post_turn", text, reply))
 
-            if load_config().get("voice_enabled", True):
-                # Speak a short form — first 2 sentences
-                spoken = _shorten_for_speech(reply)
+    def _start_workers(self) -> None:
+        import queue
+
+        self._speech = queue.Queue()
+        self._jobs = queue.Queue()
+
+        def speech_loop() -> None:
+            while True:
+                sentence = self._speech.get()
                 try:
-                    self.voice.speak(spoken)
+                    if sentence and not safety.is_halted():
+                        t = time.time()
+                        self.voice.speak(sentence)
+                        timing.info("tts_sentence %.2fs chars=%d", time.time() - t, len(sentence))
                 except Exception:
                     logger.exception("speak failed")
-            return reply
+
+        def jobs_loop() -> None:
+            while True:
+                job = self._jobs.get()
+                try:
+                    if job[0] == "post_turn":
+                        _, user_text, reply = job
+                        t = time.time()
+                        self.memory.auto_extract(user_text, reply)
+                        if self.brain:
+                            self.memory.embed_pending()
+                            if self.memory.needs_summarization():
+                                older = self.memory.messages_to_summarize()
+                                if older:
+                                    summary = self.brain.summarize(older)
+                                    if summary:
+                                        self.memory.add_summary(summary, older[-1]["id"])
+                                        self.memory.drop_messages_up_to(older[-1]["id"])
+                        timing.info("post_turn_bg %.2fs", time.time() - t)
+                except Exception:
+                    logger.exception("background job failed")
+
+        threading.Thread(target=speech_loop, name="pc-agent-speech", daemon=True).start()
+        threading.Thread(target=jobs_loop, name="pc-agent-jobs", daemon=True).start()
 
     def bootstrap_tools_only(self) -> None:
         declarations, handlers = build_tooling(
@@ -291,6 +347,7 @@ class Agent:
             halt_fn=lambda: safety.halt("ui"),
             resume_fn=safety.resume,
             status_fn=lambda: (self.brain.model_note if self.brain else ""),
+            stream_fn=self.chat_stream,
         )
         run_server(app, CHAT_HOST, CHAT_PORT)
         url = f"http://{CHAT_HOST}:{CHAT_PORT}/"
@@ -334,6 +391,50 @@ class Agent:
         safety.stop_kill_switch()
         self.memory.close()
         sys.exit(0)
+
+
+class SentenceSplitter:
+    """Accumulate streamed text; emit complete sentences for low-latency TTS."""
+
+    def __init__(self, min_chars: int = 8) -> None:
+        self.buf = ""
+        self.min_chars = min_chars
+
+    def feed(self, delta: str) -> list[str]:
+        self.buf += delta
+        out: list[str] = []
+        import re as _re
+        while True:
+            m = _re.search(r"[.!?…](?=\s)|\n+", self.buf)
+            if not m:
+                break
+            end = m.end()
+            sent = self.buf[:end].strip()
+            if len(sent) < self.min_chars and "\n" not in m.group(0):
+                # too short — wait for more unless there's no further break
+                nxt = _re.search(r"[.!?…](?=\s)|\n+", self.buf[end:])
+                if not nxt:
+                    break
+                end = end + nxt.end()
+                sent = self.buf[:end].strip()
+            self.buf = self.buf[end:]
+            sent = _clean_for_speech(sent)
+            if sent:
+                out.append(sent)
+        return out
+
+    def flush(self) -> str:
+        s = _clean_for_speech(self.buf.strip())
+        self.buf = ""
+        return s
+
+
+def _clean_for_speech(s: str) -> str:
+    import re as _re
+    s = _re.sub(r"```.*?```", "", s, flags=_re.S)
+    s = _re.sub(r"[*_`#>|]+", "", s)
+    s = _re.sub(r"^\s*[-•]\s*", "", s)
+    return s.strip()
 
 
 def _shorten_for_speech(text: str, max_chars: int = 400) -> str:

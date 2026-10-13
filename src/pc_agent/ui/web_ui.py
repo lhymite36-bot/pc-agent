@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
+import json as _json
 from pydantic import BaseModel
 
 if TYPE_CHECKING:
@@ -157,15 +158,31 @@ async function sendChat(){
   const text = input.value.trim();
   if (!text) return;
   append('user', text); input.value='';
-  const r = await fetch('/api/chat', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
-  const j = await r.json();
-  append('assistant', j.reply || '(no reply)');
-  if (j.model_note) $('#model-note').textContent = j.model_note;
+  const el = append('assistant', '…');
+  let got = '';
+  try {
+    const r = await fetch('/api/chat/stream', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({text})});
+    const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = '';
+    while (true) {
+      const {value, done} = await reader.read(); if (done) break;
+      buf += dec.decode(value, {stream:true});
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const line = buf.slice(0, i); buf = buf.slice(i + 2);
+        if (!line.startsWith('data: ')) continue;
+        const j = JSON.parse(line.slice(6));
+        if (j.delta) { got += j.delta; el.textContent = got; $('#chat-log').scrollTop = 1e9; }
+        if (j.done && j.model_note) $('#model-note').textContent = j.model_note;
+      }
+    }
+  } catch (e) { if (!got) el.textContent = 'Lost connection to the agent. Try again.'; }
+  if (!got) el.textContent = el.textContent === '…' ? '(no reply)' : el.textContent;
 }
 function append(role, text){
   const d = document.createElement('div');
   d.className = 'msg '+role; d.textContent = text;
   $('#chat-log').appendChild(d); $('#chat-log').scrollTop = 1e9;
+  return d;
 }
 $('#chat-input').addEventListener('keydown', e => { if(e.key==='Enter') sendChat(); });
 async function loadMemory(){
@@ -270,6 +287,7 @@ def create_app(
     halt_fn: Callable[[], None],
     resume_fn: Callable[[], None] | None = None,
     status_fn: Callable[[], str] | None = None,
+    stream_fn: Callable[[str], Any] | None = None,
 ) -> FastAPI:
     app = FastAPI(title="PC Agent")
 
@@ -286,6 +304,20 @@ def create_app(
             logger.exception("chat failed")
             return {"reply": "Something went wrong on my side. Try again in a moment.",
                     "model_note": status_fn() if status_fn else ""}
+
+    @app.post("/api/chat/stream")
+    def api_chat_stream(body: ChatIn):
+        def gen():
+            try:
+                source = stream_fn(body.text) if stream_fn else iter([chat_fn(body.text)])
+                for delta in source:
+                    yield "data: " + _json.dumps({"delta": delta}) + "\n\n"
+            except Exception:
+                logger.exception("stream failed")
+                yield "data: " + _json.dumps({"delta": "Something went wrong on my side. Try again in a moment."}) + "\n\n"
+            yield "data: " + _json.dumps({"done": True, "model_note": status_fn() if status_fn else ""}) + "\n\n"
+        return StreamingResponse(gen(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.get("/api/status")
     def api_status() -> dict:

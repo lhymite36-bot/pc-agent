@@ -199,6 +199,36 @@ class MemoryStore:
             logger.warning("Embedding failed: %s", exc)
             return None
 
+    def _query_vec(self, query: str) -> list[float] | None:
+        cache = self.__dict__.setdefault("_qcache", {})
+        if query in cache:
+            return cache[query]
+        vec = self._embed(query)
+        if vec:
+            if len(cache) > 256:
+                cache.clear()
+            cache[query] = vec
+        return vec
+
+    def embed_pending(self, limit: int = 50) -> int:
+        """Background: compute embeddings for memories that lack one."""
+        if self._embed_fn is None:
+            return 0
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, content FROM memories WHERE embedding IS NULL ORDER BY id DESC LIMIT ?", (limit,)
+            ).fetchall()
+        n = 0
+        for r in rows:
+            vec = self._embed(r["content"])
+            if not vec:
+                break  # embedding unavailable; try later
+            with self._lock:
+                self._conn.execute("UPDATE memories SET embedding=? WHERE id=?", (self._pack_embedding(vec), r["id"]))
+                self._conn.commit()
+            n += 1
+        return n
+
     # --- remember / recall / forget ---
 
     def remember(
@@ -206,6 +236,7 @@ class MemoryStore:
         content: str,
         kind: str = "note",
         tags: str | Iterable[str] = "",
+        embed_now: bool = False,
     ) -> MemoryItem:
         content = (content or "").strip()
         if not content:
@@ -218,7 +249,7 @@ class MemoryStore:
         else:
             tags_s = str(tags or "").strip()
         now = self._now()
-        emb = self._pack_embedding(self._embed(content))
+        emb = self._pack_embedding(self._embed(content)) if embed_now else None
         with self._lock:
             cur = self._conn.execute(
                 """
@@ -316,7 +347,7 @@ class MemoryStore:
 
         # Embedding similarity (optional)
         if use_embeddings and self._embed_fn is not None:
-            qvec = self._embed(query)
+            qvec = self._query_vec(query)
             if qvec:
                 with self._lock:
                     all_rows = self._conn.execute(
@@ -569,7 +600,7 @@ class MemoryStore:
         summary = self.get_latest_summary()
         if summary:
             parts.append("## Conversation summary so far\n" + summary.strip())
-        items = self.recall(user_text, limit=MAX_RECALL_ITEMS)
+        items = self.recall(user_text, limit=MAX_RECALL_ITEMS, use_embeddings=False)
         if not items:
             # Always surface a few durable preferences/facts
             items = self.list_memories(limit=8, kinds=["fact", "preference"])
