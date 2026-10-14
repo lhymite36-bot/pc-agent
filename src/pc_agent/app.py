@@ -56,6 +56,20 @@ logger = logging.getLogger("pc_agent")
 timing = logging.getLogger("pc_agent.timing")
 
 
+def _speak_tool_noop(args: dict) -> dict:
+    # Replies are spoken automatically by the single speech worker (1.0.10).
+    # Speaking here too would play a second voice.
+    return {"ok": True, "note": "Your reply text is spoken automatically. Do not call speak."}
+
+
+FREE_TOOL_ALLOW = {
+    "run_shell", "system_info", "open_url", "open_app", "take_screenshot", "clipboard_get",
+    "clipboard_set", "list_windows", "focus_window", "hotkey", "type_text", "list_files",
+    "read_file", "write_file", "schedule_task", "list_tasks", "run_skill", "list_skills",
+    "remember", "recall", "forget",
+}
+
+
 class Agent:
     def __init__(self) -> None:
         self.memory = MemoryStore()
@@ -78,6 +92,65 @@ class Agent:
             voice_engine_fn=lambda: self.voice,
             on_gemini_audio=self.cancel_local_speech,
         )
+
+    def _free_fallback(self, text: str, gemini_exc):
+        """Gemini is out: free providers (Groq, OpenRouter, Mistral, Cloudflare),
+        then Ollama (1 s probe), then the reply cache, then a clear notice."""
+        from pc_agent.core import providers, reply_cache
+
+        def out(reply: str):
+            return reply  # chat_stream's speech worker speaks it (single voice)
+
+        if providers.candidates():
+            msgs = [{"role": "system", "content": self._free_system_prompt(text)}]
+            for m in self.memory.get_recent_messages(6)[:-1] if hasattr(self.memory, "get_recent_messages") else []:
+                if m.get("role") in ("user", "assistant") and m.get("content"):
+                    msgs.append({"role": m["role"], "content": str(m["content"])[:1500]})
+            msgs.append({"role": "user", "content": text})
+            tools = providers.to_openai_tools(getattr(self, "_declarations", []), FREE_TOOL_ALLOW)
+            try:
+                reply = providers.chat(msgs, tools, getattr(self, "_handlers", {}),
+                                       on_provider=lambda p, m: setattr(self, "_free_note", f"{p} · {m}"))
+                reply_cache.put(text, reply)
+                yield out(reply)
+                return
+            except providers.ProvidersExhausted as exc:
+                logger.info("free providers exhausted: %s", exc)
+            except Exception:
+                logger.exception("free providers failed")
+        try:
+            from pc_agent.core import ollama as ol
+            ok, models = ol.available(timeout=0.8)
+            if ok and models:
+                reply = ol.chat([{"role": "system", "content": "You are Atlas, a concise PC helper."},
+                                 {"role": "user", "content": text}], model=ol.pick_model(models))
+                if reply:
+                    yield out(reply)
+                    return
+        except Exception:
+            logger.debug("ollama skipped", exc_info=True)
+        cached = reply_cache.get(text)
+        if cached:
+            yield out(cached)
+            return
+        reset = 0.0
+        try:
+            now = time.time()
+            vals = [v for v in self.brain.health.cooling.values() if v > now] if self.brain else []
+            reset = min(vals) if vals else 0.0
+        except Exception:
+            pass
+        yield providers.exhausted_notice(reset or None)
+
+    def _free_system_prompt(self, text: str) -> str:
+        name = load_config().get("agent_name") or "Atlas"
+        ctx = ""
+        try:
+            ctx = self.memory.build_memory_context(text) or ""
+        except Exception:
+            pass
+        return (f"You are {name}, a witty, concise assistant that controls the user's Windows PC "
+                "through the provided tools. Keep replies short and conversational.\n" + ctx[:1500])
 
     def cancel_local_speech(self) -> None:
         """Drop queued sentences and stop current playback (Gemini Live takes over)."""
@@ -108,7 +181,7 @@ class Agent:
             self.memory, scheduler=None, planner=None
         )
         # Wire speak
-        handlers["speak"] = lambda args: self.voice.speak(args.get("text") or "")
+        handlers["speak"] = _speak_tool_noop
 
         self._handlers = handlers
         self._declarations = declarations
@@ -125,7 +198,7 @@ class Agent:
             declarations, handlers = build_tooling(
                 self.memory, scheduler=None, planner=self.planner
             )
-            handlers["speak"] = lambda args: self.voice.speak(args.get("text") or "")
+            handlers["speak"] = _speak_tool_noop
             self._handlers = handlers
             self._declarations = declarations
             self.brain.tool_handlers = handlers
@@ -140,7 +213,7 @@ class Agent:
         declarations, handlers = build_tooling(
             self.memory, scheduler=self.scheduler, planner=self.planner
         )
-        handlers["speak"] = lambda args: self.voice.speak(args.get("text") or "")
+        handlers["speak"] = _speak_tool_noop
         self._handlers = handlers
         self._declarations = declarations
         if self.brain:
@@ -166,6 +239,7 @@ class Agent:
             model=self.cfg.get("model"),
             memory_context_fn=self.memory.build_memory_context,
         )
+        self.brain.fallback_fn = self._free_fallback
         self.brain.pick_model(self.cfg.get("model"))
         self.memory.set_embedder(self.brain.embed)
         self.cfg["model"] = self.brain.model
@@ -213,7 +287,20 @@ class Agent:
             if not self.brain:
                 key = get_api_key()
                 if not key:
-                    yield "Add your Gemini API key in Settings first."
+                    # No Gemini key: still useful via offline router + free providers.
+                    from pc_agent.core.offline_router import try_handle
+                    off = try_handle(text)
+                    if off is not None:
+                        yield off
+                        return
+                    self.memory.add_message("user", text)
+                    parts = []
+                    for d in self._free_fallback(text, None):
+                        parts.append(d)
+                        yield d
+                    self.memory.add_message("assistant", "".join(parts))
+                    if speak is None or speak:
+                        self.say("".join(parts))
                     return
                 self.api_key = key
                 self.voice = VoiceEngine(key)
@@ -325,7 +412,7 @@ class Agent:
         declarations, handlers = build_tooling(
             self.memory, scheduler=self.scheduler, planner=self.planner
         )
-        handlers["speak"] = lambda args: self.voice.speak(args.get("text") or "")
+        handlers["speak"] = _speak_tool_noop
         if self.brain:
             if self.planner is None:
                 self.planner = Planner(
@@ -334,7 +421,7 @@ class Agent:
                 declarations, handlers = build_tooling(
                     self.memory, scheduler=self.scheduler, planner=self.planner
                 )
-                handlers["speak"] = lambda args: self.voice.speak(args.get("text") or "")
+                handlers["speak"] = _speak_tool_noop
             self.brain.tool_handlers = handlers
             self.brain.tool_declarations = declarations
 

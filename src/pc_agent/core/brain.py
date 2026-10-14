@@ -32,7 +32,7 @@ from pc_agent.core.models import (
 logger = logging.getLogger("pc_agent.brain")
 timing = logging.getLogger("pc_agent.timing")
 
-MAX_HISTORY_CONTENTS = 24   # capped window sent to the model
+MAX_HISTORY_CONTENTS = 12   # capped window sent to the model
 MAX_TOOL_ROUNDS = 10
 MAX_TOOL_RESULT_CHARS = 6000
 
@@ -119,6 +119,8 @@ class Brain:
         self.tool_declarations = tool_declarations or []
         self.memory_context_fn = memory_context_fn
         self._history: list[Any] = []
+        # Called with (user_text, exc) when every Gemini model fails; returns an iterator or None.
+        self.fallback_fn: Callable[[str, BaseException], Any] | None = None
         self._tools_cache: tuple[int, Any] | None = None
         self._persist_switch = False
         self.health = ModelHealth(data_dir() / "model_health.json")
@@ -417,6 +419,23 @@ class Brain:
             except AllModelsFailed as exc:
                 if self._history and self._history[-1] is user_msg:
                     self._history.pop()
+                try:
+                    from pc_agent.core.quota import is_quota_exhausted, parse_retry_seconds
+                    from pc_agent.core.keys import mark_quota, rotate
+                    if is_quota_exhausted(exc):
+                        mark_quota(None, parse_retry_seconds(exc) or 3600)
+                        new_key = rotate()
+                        if new_key:
+                            self.client = _make_client(new_key)
+                            self.refresh_models()
+                except Exception:
+                    logger.debug("key rotate failed", exc_info=True)
+                fb = getattr(self, "fallback_fn", None)
+                if fb is not None:
+                    alt = fb(user_text, exc)
+                    if alt is not None:
+                        yield from alt
+                        return
                 try:
                     from pc_agent.core.quota import (
                         format_quota_notice,

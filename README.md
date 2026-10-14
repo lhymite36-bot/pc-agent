@@ -158,3 +158,19 @@ GUI / OS automation is mocked or skipped on Linux CI. Windows build is produced 
 ## License
 
 MIT — for Pedro's personal use.
+
+## Free backup brains (1.0.11) — $0, no card
+
+When Gemini's free quota runs out, Atlas fails over (within ~10 s) to other free providers, fastest first, keeping tool calling:
+
+| Provider | Get a free key (no card) | Add it |
+|---|---|---|
+| Gemini (main) | https://aistudio.google.com/apikey | `/keys add AIza…` |
+| Groq (fastest, + free Whisper STT) | https://console.groq.com/keys | `/keys add groq <key>` |
+| OpenRouter `:free` models | https://openrouter.ai/keys | `/keys add openrouter <key>` |
+| Mistral Free mode | https://console.mistral.ai/api-keys | `/keys add mistral <key>` |
+| Cloudflare Workers AI | https://dash.cloudflare.com/profile/api-tokens | `/keys add cloudflare ACCOUNT_ID:TOKEN` |
+
+Several keys per provider are fine; each key gets its own cooldown until its quota resets. `/setup` prints this list.
+Not included: GitHub Models (retired July 2026), Cerebras (new accounts need a card).
+Ollama is probed in under 1 s and skipped silently if absent. A small reply cache and the offline PC-command router keep working at zero quota.

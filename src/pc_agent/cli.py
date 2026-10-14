@@ -175,6 +175,8 @@ class TerminalApp:
                 "  /model [NAME]   Show / prefer Gemini model\n"
                 "  /keys           List API keys (rotation)\n"
                 "  /keys add KEY   Add another free Gemini API key\n"
+                "  /keys add PROVIDER KEY  Free backup brain: groq, openrouter, mistral, cloudflare\n"
+                "  /setup          Where to get free keys (no card)\n"
                 "  /keys rotate    Switch to the next key\n"
                 "  /memory [q]     Search / list memories\n"
                 "  /ollama         Check local Ollama fallback\n"
@@ -198,6 +200,10 @@ class TerminalApp:
             return True
         if cmd == "/memory":
             self.cmd_memory(arg)
+            return True
+        if cmd == "/setup":
+            from pc_agent.core import providers
+            self.print(providers.setup_text())
             return True
         if cmd == "/keys":
             self.cmd_keys(arg)
@@ -310,27 +316,8 @@ class TerminalApp:
         reply = "".join(reply_parts)
         print()
 
-        # If Gemini is out, try Ollama, then offline apology with tips
-        from pc_agent.core.quota import is_quota_exhausted, format_quota_notice, model_reset_map
-        if (not reply) or is_quota_exhausted(reply) or reply.startswith("All the Gemini"):
-            local = self._ollama_chat(text)
-            if local:
-                self.print(f"\n[dim](local Ollama)[/dim] {local}" if self._console else f"\n(local Ollama) {local}")
-                self._speak_free(local)
-                return
-            if is_quota_exhausted(reply) or (reply or "").startswith("All the Gemini"):
-                # Enrich notice with per-model resets; strip any old billing wording
-                health = getattr(getattr(self.agent, "brain", None), "health", None)
-                resets = model_reset_map(health) if health else None
-                notice = format_quota_notice(reply or "429", model_resets=resets)
-                if reply and reply != notice:
-                    # Replace the streamed quota line visually
-                    pass
-                self.print(f"[dim]{notice}[/dim]" if self._console else notice)
-                tip = try_handle("what time is it")  # sanity
-                self.status("Tip: try “open chrome”, “open downloads”, “screenshot”, “volume mute”.")
-                self._speak_free("I'm on free offline mode for a bit. Try opening an app or asking for the time.")
-                return
+        # Gemini/free-provider/Ollama failover and the "all used up" notice are
+        # handled inside agent.chat_stream; nothing else to do (and no 2nd voice).
 
     # --- push-to-talk ---
 
@@ -417,7 +404,21 @@ class TerminalApp:
             logger.warning("local STT failed: %s", exc)
             self.status(f"Offline STT issue: {exc}")
 
-        # 2) Cloud STT with shared model failover (only if local failed)
+        # 2) Groq Whisper (free, no card) if a Groq key exists
+        try:
+            from pc_agent.core import providers
+            if providers.list_keys("groq"):
+                import io, wave
+                buf = io.BytesIO()
+                with wave.open(buf, "wb") as w:
+                    w.setnchannels(1); w.setsampwidth(2); w.setframerate(16000)
+                    w.writeframes(pcm)
+                text = providers.transcribe(buf.getvalue())
+                if text:
+                    return text
+        except Exception as exc:
+            logger.info("groq STT skipped: %s", exc)
+        # 3) Gemini STT with shared model failover (only if the above failed)
         return self._stt_cloud(pcm)
 
     def _stt_cloud(self, pcm: bytes) -> str:
@@ -585,6 +586,24 @@ class TerminalApp:
                 cool = f"  cooling until {r['reset_local']} local" if r["cooling"] else ""
                 self.print(f" {flag} {r['id']:10} {r['hint']}{cool}")
             return
+        from pc_agent.core import providers
+        toks = arg.split()
+        if toks and toks[0] == "add" and len(toks) >= 3 and providers.resolve(toks[1]) not in (None, "gemini"):
+            prov = providers.resolve(toks[1])
+            n = providers.add_key(prov, toks[2])
+            self.print(f"Added {providers.BY_NAME[prov].label} key #{n}. It's used when Gemini is out.")
+            return
+        if toks and toks[0] == "add" and len(toks) >= 3 and providers.resolve(toks[1]) == "gemini":
+            arg = "add " + toks[2]
+        if toks and toks[0] == "add" and len(toks) == 2 and not toks[1].startswith("AIza") and providers.resolve(toks[1]):
+            self.print(f"Usage: /keys add {toks[1]} <key>   (get one: /setup)")
+            return
+        if not arg:
+            for name in providers.configured():
+                for i, _ in enumerate(providers.list_keys(name)):
+                    until = providers.cooling_until(name, i)
+                    cool = f"  cooling until {time.strftime('%H:%M', time.localtime(until))} local" if until else ""
+                    self.print(f"   {name}#{i + 1}{cool}")
         if arg.startswith("add "):
             secret = arg[4:].strip()
             info = keystore.add_key(secret)
@@ -604,7 +623,7 @@ class TerminalApp:
                 except Exception:
                     pass
             return
-        self.print("Usage: /keys | /keys add AIza… | /keys rotate")
+        self.print("Usage: /keys | /keys add <provider> <key> | /keys add AIza… | /keys rotate   (/setup lists free signups)")
 
     def cmd_ollama(self) -> None:
         from pc_agent.core import ollama as ol
@@ -702,10 +721,11 @@ def run_cli(argv: list[str] | None = None) -> int:
     agent = Agent()
     # Bootstrap brain/tools/scheduler but do NOT bind the web port
     agent.bootstrap()
-    if not get_api_key():
-        print("No Gemini API key yet.")
-        print("Open the desktop app once and save your key in Settings, or set it via keyring.")
-        print("Continuing — /model and chat will ask again after you add a key.")
+    from pc_agent.core import providers as _prov
+    if not get_api_key() and not _prov.configured():
+        print("No AI keys yet — first-run setup:")
+        print(_prov.setup_text())
+        print("Continuing; PC commands work offline meanwhile.")
     app = TerminalApp(agent)
     try:
         app.run()

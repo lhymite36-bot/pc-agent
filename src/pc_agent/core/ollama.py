@@ -14,7 +14,22 @@ DEFAULT_HOST = "http://127.0.0.1:11434"
 PREFERRED_MODELS = ["llama3.2:3b", "qwen2.5:3b", "llama3.2", "phi3:mini", "gemma2:2b"]
 
 
-def available(host: str = DEFAULT_HOST, timeout: float = 1.5) -> tuple[bool, list[str]]:
+_probe_cache: dict[str, tuple[float, bool, list[str]]] = {}
+PROBE_TTL_SEC = 60.0
+
+
+def available(host: str = DEFAULT_HOST, timeout: float = 0.8) -> tuple[bool, list[str]]:
+    """Fast probe (<=1 s), cached 60 s, never raises. Not installed => (False, [])."""
+    import time as _t
+    hit = _probe_cache.get(host)
+    if hit and _t.time() - hit[0] < PROBE_TTL_SEC:
+        return hit[1], hit[2]
+    ok, models = _probe(host, min(timeout, 1.0))
+    _probe_cache[host] = (_t.time(), ok, models)
+    return ok, models
+
+
+def _probe(host: str, timeout: float) -> tuple[bool, list[str]]:
     try:
         r = httpx.get(f"{host}/api/tags", timeout=timeout)
         r.raise_for_status()
@@ -68,7 +83,7 @@ def chat(
             payload["messages"][0]["content"] += system_extra
         else:
             payload["messages"].insert(0, {"role": "system", "content": system_extra.strip()})
-    r = httpx.post(f"{host}/api/chat", json=payload, timeout=120.0)
+    r = httpx.post(f"{host}/api/chat", json=payload, timeout=httpx.Timeout(45.0, connect=1.0))
     r.raise_for_status()
     data = r.json()
     return ((data.get("message") or {}).get("content") or "").strip()
