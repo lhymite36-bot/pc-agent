@@ -436,11 +436,6 @@ class Brain:
                                 logger.info("Rotated API key after quota; will use it next turn")
                         except Exception:
                             logger.debug("key rotate failed", exc_info=True)
-                        from pc_agent.config import load_config, save_config
-                        cfg = load_config()
-                        if cfg.get("voice_mode") != "offline":
-                            cfg["voice_mode"] = "offline"
-                            save_config(cfg)
                         yield format_quota_notice(exc, model_resets=model_reset_map(self.health))
                     else:
                         yield ALL_FAILED_MSG

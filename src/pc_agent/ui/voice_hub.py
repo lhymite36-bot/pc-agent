@@ -19,7 +19,9 @@ class VoiceHub:
         api_key_fn: Callable[[], str | None],
         chat_fn: Callable[[str], str],
         voice_engine_fn: Callable,
+        on_gemini_audio: Callable[[], None] | None = None,
     ) -> None:
+        self.on_gemini_audio = on_gemini_audio
         self.api_key_fn = api_key_fn
         self.chat_fn = chat_fn
         self.voice_engine_fn = voice_engine_fn
@@ -89,6 +91,11 @@ class VoiceHub:
                     return
                 asyncio.run_coroutine_threadsafe(self._send_json(ev), loop)
 
+            if self.on_gemini_audio:
+                try:
+                    self.on_gemini_audio()  # silence any queued local voice
+                except Exception:
+                    pass
             self._session = LiveVoiceSession(
                 api_key=key,
                 on_pcm_out=on_pcm,

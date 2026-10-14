@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import time
 import asyncio
 import io
 import logging
@@ -44,6 +45,10 @@ class VoiceEngine:
         self._client = None
         self._play_lock = threading.Lock()
         self._stop = threading.Event()
+        # Exactly one utterance (and one engine) at a time.
+        self._speak_lock = threading.Lock()
+        self.last_engine: str | None = None
+        self.engine_log: list[str] = []
         if api_key:
             try:
                 from google import genai
@@ -67,7 +72,20 @@ class VoiceEngine:
 
     @staticmethod
     def mode() -> str:
-        return load_config().get("voice_mode", "live")
+        cfg = load_config()
+        mode = cfg.get("voice_mode", "live")
+        # 1.0.7-1.0.9 wrote voice_mode=offline on any quota hit; that stuck forever.
+        # Only honour "offline" if the user picked it explicitly.
+        if mode == "offline" and not cfg.get("voice_offline_user"):
+            return "live"
+        return mode
+
+    @staticmethod
+    def gemini_voice_paused() -> bool:
+        try:
+            return float(load_config().get("voice_gemini_paused_until", 0)) > time.time()
+        except Exception:
+            return False
 
     @staticmethod
     def voice_id() -> str:
@@ -85,44 +103,62 @@ class VoiceEngine:
             raise ValueError(mode)
         cfg = load_config()
         cfg["voice_mode"] = mode
+        cfg["voice_offline_user"] = mode == "offline"
         save_config(cfg)
 
     # --- public speak ---
 
     def speak(self, text: str, on_chunk: Callable[[bytes], None] | None = None) -> dict:
-        """Speak text using the best available path. Streams when possible."""
+        """Speak with exactly ONE engine: Gemini (Live, then TTS). The local
+        SAPI voice is only a silent fallback when Gemini audio fails."""
         if not text or not text.strip():
             return {"ok": False, "error": "empty text"}
         if not load_config().get("voice_enabled", True):
             return {"ok": True, "skipped": True, "reason": "voice_disabled"}
+        with self._speak_lock:
+            self._stop.clear()
+            result = self._speak_one(text, on_chunk)
+            eng = result.get("engine") or result.get("path")
+            if result.get("ok") and eng:
+                self.last_engine = eng
+                self.engine_log.append(eng)
+                del self.engine_log[:-50]
+            return result
 
-        self._stop.clear()
+    def _speak_one(self, text: str, on_chunk) -> dict:
         mode = self.mode()
         styled = self._with_style(text)
-
-        if mode == "live" and self._client is not None:
+        gemini_ok = self._client is not None and mode in {"live", "tts"} and not self.gemini_voice_paused()
+        err = ""
+        if gemini_ok and mode == "live":
             result = self._speak_live(styled, on_chunk=on_chunk)
             if result.get("ok"):
-                return result
-            logger.info("Live voice failed (%s); trying TTS", result.get("error"))
-
-        if mode in {"live", "tts"} and self._client is not None:
-            result = self._speak_tts(styled, on_chunk=on_chunk)
-            if result.get("ok"):
+                result.setdefault("engine", "live")
                 return result
             err = result.get("error") or ""
-            logger.info("TTS failed (%s); trying offline", err)
+            logger.info("Live voice failed (%s); trying TTS", err)
+            if self._stop.is_set():
+                return result  # partial Gemini audio played; never add a 2nd voice
+        if gemini_ok:
+            result = self._speak_tts(styled, on_chunk=on_chunk)
+            if result.get("ok"):
+                result.setdefault("engine", "tts")
+                return result
+            err = result.get("error") or err
+            logger.info("TTS failed (%s); using local fallback voice", err)
+            if self._stop.is_set():
+                return result
             if is_quota_exhausted(err):
+                from pc_agent.core.quota import parse_retry_seconds
                 try:
                     cfg = load_config()
-                    cfg["voice_mode"] = "offline"
+                    cfg["voice_gemini_paused_until"] = time.time() + (parse_retry_seconds(err) or 3600)
                     save_config(cfg)
                 except Exception:
                     pass
                 result = self._speak_offline(text)
                 result["quota_notice"] = format_quota_notice(err)
                 return result
-
         return self._speak_offline(text)
 
     def stop(self) -> None:

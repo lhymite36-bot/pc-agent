@@ -76,7 +76,20 @@ class Agent:
             api_key_fn=get_api_key,
             chat_fn=self.chat,
             voice_engine_fn=lambda: self.voice,
+            on_gemini_audio=self.cancel_local_speech,
         )
+
+    def cancel_local_speech(self) -> None:
+        """Drop queued sentences and stop current playback (Gemini Live takes over)."""
+        try:
+            while True:
+                self._speech.get_nowait()
+        except Exception:
+            pass
+        try:
+            self.voice.stop()
+        except Exception:
+            pass
 
     def bootstrap(self) -> None:
         if not self.api_key:
@@ -175,9 +188,22 @@ class Agent:
         return False
 
     def chat(self, text: str) -> str:
-        return "".join(self.chat_stream(text))
+        """Text-only reply. Callers that play audio themselves (Live fallback,
+        web voice, Telegram) must not get a second voice from the worker."""
+        return "".join(self.chat_stream(text, speak=False))
 
-    def chat_stream(self, text: str):
+    def say(self, text: str) -> None:
+        """Queue text on the single speech worker (one engine per utterance)."""
+        if not text or not load_config().get("voice_enabled", True):
+            return
+        splitter = SentenceSplitter()
+        for s in splitter.feed(_clean_for_speech(text) if "_clean_for_speech" in globals() else text):
+            self._speech.put(s)
+        tail = splitter.flush()
+        if tail:
+            self._speech.put(tail)
+
+    def chat_stream(self, text: str, speak: bool | None = None):
         """Yield reply deltas; speak sentence by sentence; memory work after the reply."""
         t0 = time.time()
         with self._lock:
@@ -215,7 +241,8 @@ class Agent:
                     take_screenshot({})
                     image = load_last_screenshot_bytes()
 
-            speak = load_config().get("voice_enabled", True)
+            if speak is None:
+                speak = load_config().get("voice_enabled", True)
             splitter = SentenceSplitter()
             reply_parts: list[str] = []
             first = True

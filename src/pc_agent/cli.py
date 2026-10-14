@@ -331,8 +331,6 @@ class TerminalApp:
                 self.status("Tip: try “open chrome”, “open downloads”, “screenshot”, “volume mute”.")
                 self._speak_free("I'm on free offline mode for a bit. Try opening an app or asking for the time.")
                 return
-        if reply:
-            self._speak_free(reply)
 
     # --- push-to-talk ---
 
@@ -473,11 +471,8 @@ class TerminalApp:
 
     def _force_offline_voice(self) -> None:
         from pc_agent.config import load_config, save_config
-        cfg = load_config()
-        if cfg.get("voice_mode") != "offline":
-            cfg["voice_mode"] = "offline"
-            save_config(cfg)
-            self.status("Switched voice to offline SAPI until quota resets.")
+        # STT quota != TTS quota: keep the Gemini voice; it falls back itself.
+        return
 
     # --- hands-free Live ---
 
@@ -495,6 +490,10 @@ class TerminalApp:
             self.print("Add your Gemini API key first (run the tray app Settings once, or set it via keyring).")
             return
         self.stop_voice_mode()
+        try:
+            self.agent.cancel_local_speech()
+        except Exception:
+            pass
         self.mode = "voice"
         self._ensure_browserless_tts()
         speaker = self._speaker or Speaker(device=self.spk_device)
@@ -549,36 +548,13 @@ class TerminalApp:
 
 
     def _speak_free(self, text: str) -> None:
-        """Default CLI voice: edge-tts or SAPI — not Gemini (saves quota, starts fast)."""
-        from pc_agent.config import load_config
-        if not load_config().get("voice_enabled", True):
-            return
-        # Shorten for speech
-        spoken = text.strip()
-        if len(spoken) > 400:
-            spoken = spoken[:400].rsplit(" ", 1)[0] + "…"
-        def _run():
-            try:
-                from pc_agent.core.free_tts import speak_free
-                from pc_agent.core.terminal_audio import Speaker
-                if self._speaker is None:
-                    self._speaker = Speaker(device=self.spk_device)
-                spk = self._speaker
-                def on_chunk(pcm: bytes):
-                    try:
-                        spk.write(pcm)
-                    except Exception:
-                        pass
-                # Prefer SAPI for sub-second start; edge-tts if configured
-                mode = load_config().get("cli_tts", "sapi")  # sapi | edge
-                if mode == "edge":
-                    speak_free(spoken, on_chunk=None)
-                else:
-                    from pc_agent.core.free_tts import _speak_sapi
-                    _speak_sapi(spoken)
-            except Exception:
-                logger.exception("free tts failed")
-        threading.Thread(target=_run, name="cli-tts", daemon=True).start()
+        """Speak text that did NOT come from chat_stream (offline router, Ollama,
+        notices) on the agent's single speech worker: Gemini voice first, local
+        SAPI only if Gemini audio fails. Never a parallel second engine."""
+        try:
+            self.agent.say(text)
+        except Exception:
+            logger.exception("say failed")
 
     def _ollama_chat(self, text: str) -> str:
         try:

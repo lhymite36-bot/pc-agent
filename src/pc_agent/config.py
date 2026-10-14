@@ -9,7 +9,7 @@ from pathlib import Path
 
 APP_NAME = "PC Agent"
 APP_ID = "pc-agent"
-VERSION = "1.0.9"
+VERSION = "1.0.10"
 
 # --- Brain ---
 DEFAULT_MODEL = "gemini-3.6-flash"
